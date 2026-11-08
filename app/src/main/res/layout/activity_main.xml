@@ -36,7 +36,7 @@
         android:layout_height="match_parent"
         android:visibility="gone" />
 
-    <!-- Top bar: settings, mode switch, status -->
+    <!-- Top bar: settings, status -->
     <LinearLayout
         android:id="@+id/topBar"
         android:layout_width="wrap_content"
@@ -63,24 +63,6 @@
                 android:text="⚙"
                 android:textSize="20sp" />
 
-            <com.google.android.material.button.MaterialButtonToggleGroup
-                android:id="@+id/modeToggle"
-                android:layout_width="wrap_content"
-                android:layout_height="wrap_content"
-                android:layout_marginStart="8dp"
-                app:selectionRequired="true"
-                app:singleSelection="true">
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnModeReplay"
-                    style="@style/ModeButton"
-                    android:text="Replay" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnModeDelay"
-                    style="@style/ModeButton"
-                    android:text="Delay" />
-            </com.google.android.material.button.MaterialButtonToggleGroup>
         </LinearLayout>
 
         <TextView
@@ -97,20 +79,23 @@
             android:textSize="14sp" />
     </LinearLayout>
 
-    <!-- Live / delay screen actions -->
+    <!-- Live screen actions -->
     <LinearLayout
         android:id="@+id/liveActions"
         android:layout_width="wrap_content"
         android:layout_height="wrap_content"
-        android:layout_gravity="end|center_vertical"
-        android:layout_marginEnd="20dp"
+        android:layout_gravity="bottom|start"
+        android:layout_marginStart="10dp"
+        android:layout_marginBottom="10dp"
         android:gravity="center"
-        android:orientation="vertical">
+        android:orientation="horizontal">
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnBig"
             style="@style/LiveReplayButton"
-            android:text="REPLAY" />
+            android:text="REPLAY"
+            app:icon="@drawable/ic_replay"
+            app:iconGravity="textStart" />
 
         <com.google.android.material.button.MaterialButton
             android:id="@+id/btnQuickSave"
@@ -289,6 +274,35 @@
         </LinearLayout>
     </LinearLayout>
 
+    <!-- Shown instead of the controls when they are hidden: a thin progress line and the time. -->
+    <LinearLayout
+        android:id="@+id/miniBar"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="bottom"
+        android:orientation="vertical"
+        android:visibility="gone">
+
+        <TextView
+            android:id="@+id/miniTime"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_gravity="end"
+            android:layout_marginEnd="12dp"
+            android:layout_marginBottom="4dp"
+            android:background="#80000000"
+            android:fontFamily="monospace"
+            android:paddingStart="6dp"
+            android:paddingEnd="6dp"
+            android:textColor="#FFFFFF"
+            android:textSize="13sp" />
+
+        <io.github.kilianm.refreeplay.MiniTimeline
+            android:id="@+id/miniProgress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content" />
+    </LinearLayout>
+
     <!-- Cut panel: choose the part of the clip to keep, then save it -->
     <LinearLayout
         android:id="@+id/trimPanel"
@@ -311,19 +325,34 @@
             android:textSize="16sp"
             android:textStyle="bold" />
 
-        <com.google.android.material.slider.RangeSlider
-            android:id="@+id/trimSlider"
+        <!-- The slider with a playhead on top that shows the current video position. -->
+        <FrameLayout
             android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:valueFrom="0"
-            android:valueTo="1"
-            app:labelBehavior="gone"
-            app:values="@array/trim_initial" />
+            android:layout_height="wrap_content">
+
+            <com.google.android.material.slider.RangeSlider
+                android:id="@+id/trimSlider"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:valueFrom="0"
+                android:valueTo="1"
+                app:labelBehavior="gone"
+                app:values="@array/trim_initial" />
+
+            <View
+                android:id="@+id/trimPlayhead"
+                android:layout_width="3dp"
+                android:layout_height="28dp"
+                android:layout_gravity="center_vertical"
+                android:background="#FFFFFF"
+                android:clickable="false"
+                android:focusable="false" />
+        </FrameLayout>
 
         <TextView
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
-            android:text="Drag the two handles; the video shows the frame at the handle. The start snaps to the nearest earlier key frame (at most 0.5 s)."
+            android:text="Drag the two handles; the video shows the frame at the handle. ▶ Play (or double-tap the video) shows exactly the part that will be saved; tap the video to hide this panel. The start snaps to the nearest earlier key frame (at most 0.5 s)."
             android:textColor="#BBBBBB"
             android:textSize="12sp" />
 
@@ -339,14 +368,15 @@
                 android:text="Cancel" />
 
             <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnTrimPlay"
+                style="@style/ReplayButton"
+                android:text="▶︎ Play" />
+
+            <com.google.android.material.button.MaterialButton
                 android:id="@+id/btnTrimSaveAs"
                 style="@style/ReplayButton"
                 android:text="Save as…" />
 
-            <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnTrimQuick"
-                style="@style/ReplayButton"
-                android:text="Quick save" />
         </LinearLayout>
     </LinearLayout>
 

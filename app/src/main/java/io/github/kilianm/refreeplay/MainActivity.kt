@@ -52,7 +52,6 @@ import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.media3.ui.PlayerView
 import com.google.android.material.button.MaterialButton
-import com.google.android.material.button.MaterialButtonToggleGroup
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.slider.RangeSlider
 import java.io.File
@@ -77,7 +76,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         val SPEEDS = floatArrayOf(1f, 0.5f, 0.25f, 0.125f)
 
         /** Extra buffer in delay mode, so the decoder can always start at a key frame. */
-        const val DELAY_MARGIN_S = 0.6f
 
         /** Folder under Movies/ used by quick save. */
         const val SAVE_FOLDER = "ReFreePlay"
@@ -101,7 +99,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     private lateinit var playerView: PlayerView
     private lateinit var delayView: TextureView
     private lateinit var topBar: LinearLayout
-    private lateinit var modeToggle: MaterialButtonToggleGroup
     private lateinit var statusText: TextView
     private lateinit var liveActions: LinearLayout
     private lateinit var btnBig: MaterialButton
@@ -149,10 +146,20 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     // Cutting / saving
     private var trimming = false
+
+    /** While the cut part is previewed: where playback stops (ms), otherwise -1. */
+    private var trimPlayEndMs = -1L
+    private lateinit var btnTrimPlay: MaterialButton
+    private lateinit var trimPlayhead: View
+    private lateinit var miniBar: View
+    private lateinit var miniTime: TextView
+    private lateinit var miniProgress: MiniTimeline
+
+    /** Replay screen: controls hidden (tap the video) so the whole picture is visible. */
+    private var controlsHidden = false
     private var lastTrim = floatArrayOf(0f, 1f)
     private var pendingSaveFile: File? = null
     private var quickSaving = false
-    private var updatingToggle = false
 
     private var lastFrames = 0L
     private var lastCaptured = 0L
@@ -176,7 +183,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     private val ticker = object : Runnable {
         override fun run() {
             updateStatus()
-            if (inReplay) updateReplayProgress()
+            if (inReplay) {
+                updateReplayProgress()
+                checkTrimPlayback()
+                if (trimming) updateTrimLabel()
+            }
             ui.postDelayed(this, 40)
         }
     }
@@ -210,7 +221,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         playerView = findViewById(R.id.playerView)
         delayView = findViewById(R.id.delayView)
         topBar = findViewById(R.id.topBar)
-        modeToggle = findViewById(R.id.modeToggle)
         statusText = findViewById(R.id.statusText)
         liveActions = findViewById(R.id.liveActions)
         btnBig = findViewById(R.id.btnBig)
@@ -258,6 +268,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         getSystemService(DisplayManager::class.java).registerDisplayListener(displayListener, ui)
         applyIntentSettings(intent)
         logCapabilities()
+        // Fresh start (not a rotation or return from the background): warn again if the
+        // stored settings need more memory than this phone can safely give.
+        if (savedInstanceState == null) ui.post { warnIfStoredSettingsTooLarge() }
     }
 
     override fun onNewIntent(intent: Intent) {
@@ -268,7 +281,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     /**
      * Optional launch extras, handy for testing over adb, e.g.
-     * `adb shell am start -n io.github.kilianm.refreeplay/.MainActivity --ei mode 1 --ef delay 3`
+     * `adb shell am start -n io.github.kilianm.refreeplay/.MainActivity --ef replay 30 --ef delay 3`
      */
     private fun applyIntentSettings(intent: Intent?) {
         val ex = intent?.extras ?: return
@@ -277,7 +290,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         if (ex.containsKey("h")) prefs.height = ex.getInt("h")
         if (ex.containsKey("fps")) prefs.fps = ex.getInt("fps")
         if (ex.containsKey("quality")) prefs.quality = ex.getInt("quality")
-        if (ex.containsKey("mode")) prefs.mode = ex.getInt("mode")
         if (ex.containsKey("replay")) prefs.replaySeconds = ex.getFloat("replay")
         if (ex.containsKey("delay")) prefs.delaySeconds = ex.getFloat("delay")
     }
@@ -302,7 +314,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         hideSystemBars()
         ui.post(ticker)
         applyOrientationLayout()
-        applyModeUi()
+        applyLiveUi()
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startPipeline()
             keepBufferWhilePaused = false
@@ -416,11 +428,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         camera.start(cfg, previewView.holder.surface, enc.inputSurface)
     }
 
-    /** Buffer length of the current mode, in seconds. */
+    /** Seconds the buffer keeps: the replay length (and enough for the display delay). */
     private fun activeBufferSeconds(): Float =
-        if (prefs.mode == MODE_DELAY) prefs.delaySeconds + DELAY_MARGIN_S else prefs.replaySeconds
+        BufferSizing.bufferSeconds(prefs.replaySeconds, prefs.delaySeconds)
 
-    /** Sizes the buffer for the current mode. Discards the buffered video. */
+    /** Sizes the buffer. Discards the buffered video. */
     private fun configureBuffer(cfg: CaptureConfig, resetFormat: Boolean): Boolean {
         val seconds = activeBufferSeconds()
         var capacity = min(BufferSizing.bytesFor(cfg.targetBitrate, seconds), BufferSizing.maxBytes(this))
@@ -545,23 +557,26 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             statusText.layoutParams = this
         }
 
-        liveActions.orientation = if (portrait) LinearLayout.HORIZONTAL else LinearLayout.VERTICAL
+        // Buttons in one row at the bottom: centred in portrait, bottom left in landscape. Not at the
+        // middle of the screen, where a half-folded foldable phone has its fold.
+        liveActions.orientation = LinearLayout.HORIZONTAL
         (liveActions.layoutParams as FrameLayout.LayoutParams).apply {
-            gravity = if (portrait) Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL else Gravity.END or Gravity.CENTER_VERTICAL
-            marginEnd = if (portrait) 0 else (20 * d).toInt()
-            bottomMargin = if (portrait) (32 * d).toInt() else 0
+            gravity = if (portrait) Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL else Gravity.BOTTOM or Gravity.START
+            marginStart = if (portrait) 0 else (10 * d).toInt()
+            marginEnd = 0
+            bottomMargin = ((if (portrait) 32 else 10) * d).toInt()
             liveActions.layoutParams = this
         }
         (btnQuickSave.layoutParams as LinearLayout.LayoutParams).apply {
-            width = ((if (portrait) 132 else 168) * d).toInt()
+            width = ((if (portrait) 160 else 168) * d).toInt()
             btnQuickSave.layoutParams = this
         }
-        btnBig.layoutParams = btnBig.layoutParams.apply { width = ((if (portrait) 150 else 168) * d).toInt() }
+        btnBig.layoutParams = btnBig.layoutParams.apply { width = ((if (portrait) 160 else 168) * d).toInt() }
         // Delay badge: below the buttons in landscape, above them in portrait (clear of the status line).
         (delayBadge.layoutParams as FrameLayout.LayoutParams).apply {
             gravity = if (portrait) Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL else Gravity.BOTTOM or Gravity.END
             val m = (14 * d).toInt()
-            setMargins(m, m, if (portrait) m else (20 * d).toInt(), if (portrait) ((32 + 128 + 16) * d).toInt() else m)
+            setMargins(m, m, if (portrait) m else (20 * d).toInt(), if (portrait) ((32 + 56 + 20 + 12) * d).toInt() else m)
             delayBadge.layoutParams = this
         }
 
@@ -584,7 +599,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         frameText.visibility = if (portrait) View.GONE else View.VISIBLE
     }
 
-    // ---------------------------------------------------------------- modes
+    // ---------------------------------------------------------------- live screen
 
     private fun fmtSeconds(v: Float): String =
         if (abs(v - v.roundToInt()) < 0.05f) v.roundToInt().toString() else "%.1f".format(v)
@@ -593,45 +608,25 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         if (b >= 1_000_000_000L) "%.1f GB".format(b / 1e9) else "%d MB".format(b / 1_000_000)
 
     private fun setupLiveControls() {
-        btnBig.setOnClickListener {
-            if (prefs.mode == MODE_DELAY) triggerReplay(activeBufferSeconds(), review = true)
-            else triggerReplay(prefs.replaySeconds, review = false)
-        }
+        btnBig.setOnClickListener { triggerReplay() }
         btnQuickSave.setOnClickListener { quickSaveBuffer() }
         findViewById<View>(R.id.btnSettings).setOnClickListener { showSettings() }
-        modeToggle.addOnButtonCheckedListener { _, id, checked ->
-            if (checked && !updatingToggle) switchMode(if (id == R.id.btnModeDelay) MODE_DELAY else MODE_REPLAY)
-        }
-        delayBadge.setOnClickListener { askDelay() }
+        delayBadge.setOnClickListener { showSettings() }
     }
 
-    /** Shows the elements that belong to the current mode (live/delay screen only). */
-    private fun applyModeUi() {
-        val delay = prefs.mode == MODE_DELAY
-        updatingToggle = true
-        modeToggle.check(if (delay) R.id.btnModeDelay else R.id.btnModeReplay)
-        updatingToggle = false
-        btnBig.text = if (delay) "REVIEW" else "REPLAY\n${fmtSeconds(prefs.replaySeconds)} s"
+    /** Live screen: live preview, or the delayed picture when a display delay is set. */
+    private fun applyLiveUi() {
+        val delayed = prefs.delaySeconds > 0f
+        btnBig.text = "REPLAY"
         delayBadge.text = "⏱ DELAY ${fmtSeconds(prefs.delaySeconds)} s"
         if (inReplay) return
-        delayView.visibility = if (delay) View.VISIBLE else View.GONE
-        delayBadge.visibility = if (delay) View.VISIBLE else View.GONE
-        setPreviewHidden(delay)
-        if (!delay && showingDelayWait) {
+        delayView.visibility = if (delayed) View.VISIBLE else View.GONE
+        delayBadge.visibility = if (delayed) View.VISIBLE else View.GONE
+        setPreviewHidden(delayed)
+        if (!delayed && showingDelayWait) {
             showingDelayWait = false
             messageText.visibility = View.GONE
         }
-    }
-
-    private fun switchMode(mode: Int) {
-        if (mode == prefs.mode) return
-        if (inReplay) exitReplay()
-        stopViewer()
-        prefs.mode = mode
-        val cfg = config
-        if (cfg != null && encoder != null) configureBuffer(cfg, resetFormat = false)
-        applyModeUi()
-        maybeStartViewer()
     }
 
     /** Hides the live preview by moving it off-screen (an invisible SurfaceView would stop the camera). */
@@ -665,7 +660,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     }
 
     private fun maybeStartViewer() {
-        if (prefs.mode != MODE_DELAY || inReplay || viewerRunning) return
+        if (prefs.delaySeconds <= 0f || inReplay || viewerRunning) return
         val surface = delaySurface ?: return
         if (encoder == null || !cameraActive) return
         viewer.start(surface, (prefs.delaySeconds * 1e9).toLong())
@@ -680,7 +675,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     }
 
     private fun onDelayStatus(waitSeconds: Double?) {
-        if (prefs.mode != MODE_DELAY || inReplay) return
+        if (prefs.delaySeconds <= 0f || inReplay) return
         if (waitSeconds == null) {
             if (showingDelayWait) {
                 showingDelayWait = false
@@ -718,47 +713,27 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         delayView.setTransform(m)
     }
 
-    private fun askDelay() {
-        val input = EditText(this).apply {
-            inputType = android.text.InputType.TYPE_CLASS_NUMBER or android.text.InputType.TYPE_NUMBER_FLAG_DECIMAL
-            setText(fmtSeconds(prefs.delaySeconds))
-            setSelectAllOnFocus(true)
-        }
-        val box = FrameLayout(this).apply {
-            val p = (24 * resources.displayMetrics.density).toInt()
-            setPadding(p, p / 3, p, 0)
-            addView(input)
-        }
-        MaterialAlertDialogBuilder(this)
-            .setTitle("Delay (seconds)")
-            .setView(box)
-            .setPositiveButton("OK") { _, _ ->
-                val v = parseSeconds(input.text.toString())
-                if (v == null) toast("Please enter a number between 1 and 600")
-                else applyDurations(prefs.replaySeconds, v)
-            }
-            .setNegativeButton("Cancel", null)
-            .setOnDismissListener { hideSystemBars() }
-            .show()
-    }
+    /** Parses a number of seconds ("2.5" or "2,5"); null if it is not a number. */
+    private fun parseSeconds(text: String): Float? = text.trim().replace(',', '.').toFloatOrNull()
 
-    private fun parseSeconds(text: String): Float? =
-        text.trim().replace(',', '.').toFloatOrNull()
-            ?.takeIf { it >= BufferSizing.MIN_SECONDS && it <= BufferSizing.MAX_SECONDS }
-
-    /** Stores new durations and resizes the buffer if the active mode's duration changed. */
+    /** Stores new durations; resizes the buffer if its length changed, restarts the delayed view if needed. */
     private fun applyDurations(replaySeconds: Float, delaySeconds: Float) {
-        val oldActive = activeBufferSeconds()
+        val oldBuffer = activeBufferSeconds()
+        val oldDelay = prefs.delaySeconds
         prefs.replaySeconds = replaySeconds
         prefs.delaySeconds = delaySeconds
-        applyModeUi()
-        if (activeBufferSeconds() != oldActive) {
-            if (inReplay) exitReplay()
-            stopViewer()
+        if (activeBufferSeconds() == oldBuffer && delaySeconds == oldDelay) {
+            applyLiveUi()
+            return
+        }
+        if (inReplay) exitReplay()
+        stopViewer()
+        if (activeBufferSeconds() != oldBuffer) {
             val cfg = config
             if (cfg != null && encoder != null) configureBuffer(cfg, resetFormat = false)
-            maybeStartViewer()
         }
+        applyLiveUi()
+        maybeStartViewer()
     }
 
     // ---------------------------------------------------------------- status
@@ -781,26 +756,32 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         statusText.text = if (cfg == null || enc == null) {
             "Camera stopped"
         } else {
+            // Written for the user: how much video is ready, plus warnings only when something is off.
+            val have = buffer.bufferedUs() / 1e6f
+            val want = prefs.replaySeconds
+            val parts = ArrayList<String>()
+            parts += if (have + 0.3f >= want) "Replay ready: last ${fmtSeconds(want)} s"
+            else "Recording… %d of %s s".format(have.toInt(), fmtSeconds(want))
+            if (buffer.limitedByMemory) parts += "⚠ memory full"
+            if (measuredFps > 0 && measuredFps < cfg.fps * 0.85) {
+                parts += "⚠ only %d of %d fps".format(measuredFps.roundToInt(), cfg.fps)
+            }
             val zoom = camera.zoomRatio
-            val zoomText = if (abs(zoom - 1f) > 0.01f) " · zoom %.1f×".format(zoom) else ""
-            val portrait = resources.configuration.orientation == Configuration.ORIENTATION_PORTRAIT
-            val mb = if (portrait) "" else " · %d MB".format(buffer.bufferedBytes() / 1_000_000)
-            val limited = if (buffer.limitedByMemory) " ⚠ memory full" else ""
-            "● REC  %d×%d @ %d fps (%.0f)  ·  buffer %.1f / %s s%s%s%s".format(
-                cfg.width, cfg.height, cfg.fps, measuredFps, buffer.bufferedUs() / 1e6,
-                fmtSeconds(buffer.durationUs / 1e6f), mb, zoomText, limited,
-            )
+            if (abs(zoom - 1f) > 0.01f) parts += "Zoom %.1f×".format(zoom)
+            "● " + parts.joinToString("  ·  ")
         }
     }
 
     // ---------------------------------------------------------------- replay / review
 
     /**
-     * Opens the replay screen with the last [seconds].
-     * A referee replay ([review] = false) freezes the buffer, so the decision break is not recorded;
-     * a review in delay mode keeps recording.
+     * Opens the replay screen with the last replay length.
+     * Without a display delay (referee use) the buffer is frozen, so the decision break is not
+     * recorded. With a display delay (practice) recording continues, so the delayed picture goes on.
      */
-    private fun triggerReplay(seconds: Float, review: Boolean) {
+    private fun triggerReplay() {
+        val seconds = prefs.replaySeconds
+        val review = prefs.delaySeconds > 0f
         if (inReplay) return
         val cfg = config ?: return
         val pinned = buffer.snapshot((seconds * 1_000_000).toLong())
@@ -836,7 +817,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         Log.i(TAG, "replay %.1fs: %d frames, %d kB, prepared in %d ms".format(
             seconds, snap.frames.size, mp4.length / 1000, SystemClock.elapsedRealtime() - t0))
         messageText.visibility = View.GONE
-        enterReplay(mp4, rotation, (snap.endPtsUs - snap.startPtsUs) / 1e6, freeze, review)
+        enterReplay(mp4, rotation, (snap.endPtsUs - snap.startPtsUs) / 1e6, freeze)
     }
 
     private fun resumeRecording() {
@@ -844,7 +825,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         encoder?.requestKeyFrame()
     }
 
-    private fun enterReplay(mp4: VirtualMp4, rotation: Int, seconds: Double, froze: Boolean, review: Boolean) {
+    private fun enterReplay(mp4: VirtualMp4, rotation: Int, seconds: Double, froze: Boolean) {
         inReplay = true
         replayFrozeBuffer = froze
         replayMp4 = mp4
@@ -856,9 +837,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         setPreviewHidden(true)
         liveActions.visibility = View.GONE
         topBar.visibility = View.GONE
-        replayControls.visibility = View.VISIBLE
-        replayBadge.visibility = View.VISIBLE
-        replayBadge.text = "%s · last %.1f s".format(if (review) "REVIEW" else "REPLAY", seconds)
+        setControlsHidden(false)
+        maybeShowControlsHint()
+        replayBadge.text = "REPLAY · last %.1f s".format(seconds)
         replay.load(mp4, prefs.playbackSpeed)
         seekBar.max = replay.durationMs.toInt()
         updateSpeedButton()
@@ -879,9 +860,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         playerView.visibility = View.GONE
         replayControls.visibility = View.GONE
         replayBadge.visibility = View.GONE
+        miniBar.visibility = View.GONE
+        controlsHidden = false
         liveActions.visibility = View.VISIBLE
         topBar.visibility = View.VISIBLE
-        applyModeUi()
+        applyLiveUi()
         maybeStartViewer()
     }
 
@@ -938,6 +921,36 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         val t = ((pos - replay.durationMs) / 1000.0).let { if (it > -0.005) 0.0 else it }
         timeText.text = "%.2f s".format(t)
         frameText.text = "frame %d/%d".format(replay.currentFrameIndex() + 1, replay.frameCount)
+        if (controlsHidden) {
+            miniTime.text = if (trimming) {
+                val v = trimSlider.values
+                "%s   ✂ %.1f s".format(timeText.text, v[1] - v[0])
+            } else {
+                timeText.text
+            }
+            val sel = if (trimming) trimSlider.values.let { it[0] / trimSlider.valueTo to it[1] / trimSlider.valueTo } else null
+            miniProgress.update(if (replay.durationMs > 0) pos.toFloat() / replay.durationMs else 0f, sel)
+        }
+    }
+
+    /** Hides the controls (whole picture visible, thin progress line instead) or shows them again. */
+    private fun setControlsHidden(hidden: Boolean) {
+        controlsHidden = hidden
+        // In the cut view the cut panel is hidden instead of the replay controls.
+        val panel = if (trimming) trimPanel else replayControls
+        panel.visibility = if (hidden) View.GONE else View.VISIBLE
+        replayBadge.visibility = if (hidden) View.GONE else View.VISIBLE
+        miniBar.visibility = if (hidden) View.VISIBLE else View.GONE
+        if (inReplay) updateReplayProgress()
+    }
+
+    /** Explains the tap gestures the first two times a replay is opened. */
+    private fun maybeShowControlsHint() {
+        val sp = getSharedPreferences("hints", MODE_PRIVATE)
+        val shown = sp.getInt("controlsHint", 0)
+        if (shown >= 2) return
+        sp.edit().putInt("controlsHint", shown + 1).apply()
+        toast("Tap the video to hide the controls · double-tap to play/pause")
     }
 
     override fun onReplayStateChanged() {
@@ -961,12 +974,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             updateTrimLabel()
         }
         trimSlider.addOnSliderTouchListener(object : RangeSlider.OnSliderTouchListener {
-            override fun onStartTrackingTouch(slider: RangeSlider) = replay.pause()
+            override fun onStartTrackingTouch(slider: RangeSlider) = stopTrimPlayback()
             override fun onStopTrackingTouch(slider: RangeSlider) = snapTrimStart()
         })
         findViewById<View>(R.id.btnTrimCancel).setOnClickListener { closeTrim() }
         findViewById<View>(R.id.btnTrimSaveAs).setOnClickListener { saveClipAs() }
-        findViewById<View>(R.id.btnTrimQuick).setOnClickListener { quickSaveClip() }
+        btnTrimPlay = findViewById(R.id.btnTrimPlay)
+        trimPlayhead = findViewById(R.id.trimPlayhead)
+        miniBar = findViewById(R.id.miniBar)
+        miniTime = findViewById(R.id.miniTime)
+        miniProgress = findViewById(R.id.miniProgress)
+        btnTrimPlay.setOnClickListener { toggleTrimPlayback() }
     }
 
     private fun openTrim() {
@@ -984,9 +1002,40 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     }
 
     private fun closeTrim() {
+        stopTrimPlayback()
         trimming = false
         trimPanel.visibility = View.GONE
-        if (inReplay) replayControls.visibility = View.VISIBLE
+        if (inReplay) setControlsHidden(false)
+    }
+
+    /** Plays exactly the part that will be saved (from the snapped start to the end handle), or stops. */
+    private fun toggleTrimPlayback() {
+        if (trimPlayEndMs >= 0) {
+            stopTrimPlayback()
+            return
+        }
+        snapTrimStart()
+        val v = trimSlider.values
+        trimPlayEndMs = (v[1] * 1000).toLong()
+        replay.playFrom((v[0] * 1000).toLong())
+        btnTrimPlay.text = "❚❚ Stop"
+    }
+
+    private fun stopTrimPlayback() {
+        replay.pause()
+        if (trimPlayEndMs < 0) return
+        trimPlayEndMs = -1
+        btnTrimPlay.text = "▶︎ Play"
+    }
+
+    /** Called by the ticker: stops the preview at the end handle. */
+    private fun checkTrimPlayback() {
+        if (trimPlayEndMs < 0) return
+        if (replay.positionMs() >= trimPlayEndMs || !replay.isPlaying) {
+            val end = trimPlayEndMs
+            stopTrimPlayback()
+            replay.scrubTo(end) // show exactly the last frame that will be saved
+        }
     }
 
     /** Moves the start handle back to the nearest key frame, where a cut without re-encoding can start. */
@@ -1008,10 +1057,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         updateTrimLabel()
     }
 
+    /** Updates the cut label and moves the playhead to the current video position. */
     private fun updateTrimLabel() {
         val v = trimSlider.values
         val end = trimSlider.valueTo
-        trimLabel.text = "Keep %.2f s … %.2f s   (%.1f s)".format(v[0] - end, v[1] - end, v[1] - v[0])
+        val pos = (replay.positionMs() / 1000f).coerceIn(0f, end)
+        trimLabel.text = "Keep %.2f s … %.2f s   (%.1f s)      ▶ now %.2f s".format(v[0] - end, v[1] - end, v[1] - v[0], pos - end)
+        val width = trimSlider.trackWidth
+        if (width > 0 && end > 0f) {
+            val x = trimSlider.left + trimSlider.trackSidePadding + pos / end * width
+            trimPlayhead.translationX = x - trimPlayhead.width / 2f
+        }
     }
 
     /** The part chosen with the cut sliders, or the whole replay when the cut panel is closed. */
@@ -1161,15 +1217,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             true
         }
 
-        // Replay video: swipe left/right to scrub finely, tap to play/pause.
+        // Replay video (also in the cut view): swipe left/right to scrub finely, tap to hide/show the
+        // controls or the cut panel,
+        // double-tap to play/pause (in the cut view: play the selected part).
         val slop = ViewConfiguration.get(this).scaledTouchSlop
+        val doubleTapMs = ViewConfiguration.getDoubleTapTimeout().toLong()
+        val singleTap = Runnable { if (inReplay) setControlsHidden(!controlsHidden) }
         playerView.setOnTouchListener(object : View.OnTouchListener {
             var downX = 0f
             var startMs = 0L
             var dragging = false
+            var lastTapUp = 0L
 
             override fun onTouch(v: View, e: MotionEvent): Boolean {
-                if (trimming) return true
                 when (e.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         downX = e.x
@@ -1181,7 +1241,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
                         val dx = e.x - downX
                         if (!dragging && abs(dx) > slop) {
                             dragging = true
-                            replay.pause()
+                            if (trimming) stopTrimPlayback() else replay.pause()
                             downX = e.x
                         }
                         if (dragging) {
@@ -1192,7 +1252,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
                     MotionEvent.ACTION_UP -> {
                         if (!dragging) {
-                            replay.togglePlay()
+                            val now = SystemClock.uptimeMillis()
+                            if (now - lastTapUp <= doubleTapMs) {
+                                // Double tap: play/pause, and don't toggle the controls.
+                                ui.removeCallbacks(singleTap)
+                                lastTapUp = 0
+                                // In the cut view: play or stop the selected part.
+                                if (trimming) toggleTrimPlayback() else replay.togglePlay()
+                            } else {
+                                lastTapUp = now
+                                ui.postDelayed(singleTap, doubleTapMs)
+                            }
                             v.performClick()
                         }
                     }
@@ -1211,19 +1281,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     }
 
     /**
-     * Volume keys / Bluetooth remotes:
-     * replay mode – any key starts a replay; delay mode – Volume Down opens the review,
-     * other keys quick-save; on the replay screen – Volume Down goes back, other keys play/pause.
+     * Volume keys / Bluetooth remotes: on the live screen any key starts a replay;
+     * on the replay screen Volume Down goes back, other keys play/pause.
      */
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
         if (!isTriggerKey(keyCode)) return super.onKeyDown(keyCode, event)
         if (event.repeatCount > 0) return true
         when {
             inReplay -> if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) exitReplay() else replay.togglePlay()
-            prefs.mode == MODE_DELAY ->
-                if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) triggerReplay(activeBufferSeconds(), review = true)
-                else quickSaveBuffer()
-            else -> triggerReplay(prefs.replaySeconds, review = false)
+            else -> triggerReplay()
         }
         return true
     }
@@ -1233,7 +1299,22 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     // ---------------------------------------------------------------- settings
 
-    private fun showSettings() {
+    /** Settings as chosen in the dialog, before they are checked and applied. */
+    private data class SettingsDraft(
+        val cameraKey: String,
+        val width: Int,
+        val height: Int,
+        val fps: Int,
+        val quality: Int,
+        val replayText: String,
+        val delayText: String,
+    )
+
+    /**
+     * Shows the settings. Changes are applied when the dialog is closed; settings that can't
+     * work (e.g. not enough memory) are rejected with a short explanation.
+     */
+    private fun showSettings(initial: SettingsDraft? = null) {
         val cams = runCatching { catalog.cameras() }.getOrDefault(emptyList())
         if (cams.isEmpty()) {
             toast("No camera available")
@@ -1254,37 +1335,48 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             }
 
         val cur = config
-        var wantW = cur?.width ?: prefs.width
-        var wantH = cur?.height ?: prefs.height
-        var wantFps = cur?.fps ?: prefs.fps
+        var wantW = initial?.width ?: cur?.width ?: prefs.width
+        var wantH = initial?.height ?: cur?.height ?: prefs.height
+        var wantFps = initial?.fps ?: cur?.fps ?: prefs.fps
         var sizes: List<Size> = emptyList()
         var fpsList: List<FpsOption> = emptyList()
 
-        fun updateInfo() {
+        fun draft(): SettingsDraft {
             val size = sizes.getOrNull(spResolution.selectedItemPosition)
+            return SettingsDraft(
+                cameraKey = cams[spCamera.selectedItemPosition].key,
+                width = size?.width ?: wantW,
+                height = size?.height ?: wantH,
+                fps = fpsList.getOrNull(spFps.selectedItemPosition)?.fps ?: wantFps,
+                quality = spQuality.selectedItemPosition,
+                replayText = etReplay.text.toString(),
+                delayText = etDelay.text.toString(),
+            )
+        }
+
+        fun updateInfo() {
             val f = fpsList.getOrNull(spFps.selectedItemPosition)
-            if (size == null || f == null) {
+            if (sizes.getOrNull(spResolution.selectedItemPosition) == null || f == null) {
                 infoText.text = "No supported frame rate for this resolution."
                 return
             }
-            val br = estimateBitrate(size.width, size.height, f.fps, spQuality.selectedItemPosition)
-            val sb = StringBuilder("≈ %.0f Mbit/s. Up to %s of memory (≈ %.0f s at this quality) can be used for the buffer.".format(
-                br / 1e6, fmtBytes(BufferSizing.maxBytes(this)), BufferSizing.maxSeconds(this, br)))
+            val d = draft()
+            val br = estimateBitrate(d.width, d.height, d.fps, d.quality)
+            val sb = StringBuilder()
+            val replay = parseSeconds(d.replayText)
+            val delay = parseSeconds(d.delayText)
+            if (replay != null && delay != null) {
+                val need = BufferSizing.bytesFor(br, BufferSizing.bufferSeconds(replay, delay))
+                val max = BufferSizing.maxBytes(this)
+                sb.append("Memory: needs ≈ %s of ≈ %s this phone can safely use".format(fmtBytes(need), fmtBytes(max)))
+                if (need > max) sb.append(" ⚠ too much")
+                sb.append(".\n")
+            }
+            sb.append("At these settings (≈ %.0f Mbit/s) up to ≈ %.0f s fit into memory."
+                .format(br / 1e6, min(BufferSizing.maxSeconds(this, br), BufferSizing.MAX_SECONDS)))
             if (f.unofficial) {
                 sb.append("\nThis camera does not officially offer ${f.fps} fps. If the status line shows a lower measured rate, choose 30 fps.")
             }
-            fun line(name: String, text: String, extra: Float) {
-                val s = parseSeconds(text)
-                if (s == null) {
-                    sb.append("\n$name: please enter 1–600 seconds.")
-                    return
-                }
-                sb.append("\n$name buffer: ≈ %s of memory.".format(fmtBytes(BufferSizing.bytesFor(br, s + extra))))
-                BufferSizing.warning(this, br, s + extra)?.let { sb.append(" ").append(it) }
-            }
-            line("Replay", etReplay.text.toString(), 0f)
-            line("Delay", etDelay.text.toString(), DELAY_MARGIN_S)
-            sb.append("\nOnly the buffer of the active mode uses memory; changing its length clears the buffer.")
             infoText.text = sb
         }
 
@@ -1308,13 +1400,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             fillFps()
         }
 
-        etReplay.setText(fmtSeconds(prefs.replaySeconds))
-        etDelay.setText(fmtSeconds(prefs.delaySeconds))
+        etReplay.setText(initial?.replayText ?: fmtSeconds(prefs.replaySeconds))
+        etDelay.setText(initial?.delayText ?: fmtSeconds(prefs.delaySeconds))
         spCamera.adapter = adapter(cams.map { it.label })
-        val camKey = cur?.camera?.key ?: prefs.cameraKey
+        val camKey = initial?.cameraKey ?: cur?.camera?.key ?: prefs.cameraKey
         spCamera.setSelection(cams.indexOfFirst { it.key == camKey }.coerceAtLeast(0))
         spQuality.adapter = adapter(listOf("Standard", "High", "Maximum"))
-        spQuality.setSelection(prefs.quality.coerceIn(0, 2))
+        spQuality.setSelection((initial?.quality ?: prefs.quality).coerceIn(0, 2))
         fillSizes()
 
         spCamera.onItemSelectedListener = SimpleItemSelected { fillSizes() }
@@ -1341,39 +1433,103 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         MaterialAlertDialogBuilder(this)
             .setTitle("Settings")
             .setView(view)
-            .setPositiveButton("Apply") { _, _ ->
-                val cam = cams[spCamera.selectedItemPosition]
-                val size = sizes.getOrNull(spResolution.selectedItemPosition)
-                val f = fpsList.getOrNull(spFps.selectedItemPosition)
-                val before = listOf(prefs.cameraKey, prefs.width, prefs.height, prefs.fps, prefs.quality)
-                prefs.cameraKey = cam.key
-                if (size != null) {
-                    prefs.width = size.width
-                    prefs.height = size.height
-                }
-                if (f != null) prefs.fps = f.fps
-                prefs.quality = spQuality.selectedItemPosition
-                val after = listOf(prefs.cameraKey, prefs.width, prefs.height, prefs.fps, prefs.quality)
-
-                val newReplay = parseSeconds(etReplay.text.toString())
-                val newDelay = parseSeconds(etDelay.text.toString())
-                if (newReplay == null || newDelay == null) toast("Durations must be 1–600 seconds; kept the old values.")
-                val captureChanged = before != after || config?.camera?.key != cam.key
-                if (captureChanged) {
-                    // Restarting creates a new buffer anyway.
-                    newReplay?.let { prefs.replaySeconds = it }
-                    newDelay?.let { prefs.delaySeconds = it }
-                    if (inReplay) exitReplay()
-                    messageText.visibility = View.GONE
-                    applyModeUi()
-                    restartPipeline()
-                } else {
-                    applyDurations(newReplay ?: prefs.replaySeconds, newDelay ?: prefs.delaySeconds)
-                }
+            .setOnDismissListener {
+                hideSystemBars()
+                if (!isFinishing && !isDestroyed) applySettings(draft())
             }
-            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    /** Why [d] can't be used, in one or two sentences; null if it is fine. */
+    private fun settingsProblem(d: SettingsDraft): String? {
+        val replay = parseSeconds(d.replayText)
+        val delay = parseSeconds(d.delayText)
+        val minS = BufferSizing.MIN_SECONDS
+        val maxS = BufferSizing.MAX_SECONDS
+        if (replay == null || replay < minS || replay > maxS) {
+            return "The replay length must be between ${fmtSeconds(minS)} and ${fmtSeconds(maxS)} seconds."
+        }
+        if (delay == null || delay < 0f || delay > maxS) {
+            return "The display delay must be between 0 (live picture) and ${fmtSeconds(maxS)} seconds."
+        }
+        if (delay > replay) {
+            return "The display delay (${fmtSeconds(delay)} s) can't be longer than the replay length " +
+                "(${fmtSeconds(replay)} s): the delayed picture comes from the replay memory."
+        }
+        val br = estimateBitrate(d.width, d.height, d.fps, d.quality)
+        val seconds = BufferSizing.bufferSeconds(replay, delay)
+        val need = BufferSizing.bytesFor(br, seconds)
+        val max = BufferSizing.maxBytes(this)
+        if (need > max) {
+            return "Not enough memory: ${fmtSeconds(seconds)} s at these settings need ≈ ${fmtBytes(need)}, " +
+                "but this phone can safely use only ≈ ${fmtBytes(max)} (≈ ${fmtSeconds(BufferSizing.maxSeconds(this, br).toInt().toFloat())} s). " +
+                "Shorten the replay length or lower resolution, frame rate or quality."
+        }
+        return null
+    }
+
+    /**
+     * Stored settings can need more memory than is safe (set by an older version, on another
+     * phone, or via launch extras). They are not changed automatically: the user is warned at
+     * every fresh start and can change them or continue anyway.
+     */
+    private fun warnIfStoredSettingsTooLarge() {
+        if (isFinishing || isDestroyed) return
+        val stored = SettingsDraft(
+            cameraKey = prefs.cameraKey ?: "",
+            width = prefs.width,
+            height = prefs.height,
+            fps = prefs.fps,
+            quality = prefs.quality,
+            replayText = fmtSeconds(prefs.replaySeconds),
+            delayText = fmtSeconds(prefs.delaySeconds),
+        )
+        val problem = settingsProblem(stored) ?: return
+        MaterialAlertDialogBuilder(this)
+            .setTitle("Check your settings")
+            .setMessage("$problem\n\nIf you continue anyway, the replay may be shorter than set and the phone may run low on memory.")
+            .setPositiveButton("Change settings") { _, _ -> showSettings() }
+            .setNegativeButton("Continue anyway", null)
             .setOnDismissListener { hideSystemBars() }
             .show()
+    }
+
+    /** Applies the settings from the dialog, or explains why they can't be used. */
+    private fun applySettings(d: SettingsDraft) {
+        val captureChanged = d.cameraKey != (config?.camera?.key ?: prefs.cameraKey) ||
+            d.width != prefs.width || d.height != prefs.height || d.fps != prefs.fps || d.quality != prefs.quality
+        if (!captureChanged && parseSeconds(d.replayText) == prefs.replaySeconds &&
+            parseSeconds(d.delayText) == prefs.delaySeconds
+        ) return // nothing changed
+        val problem = settingsProblem(d)
+        if (problem != null) {
+            MaterialAlertDialogBuilder(this)
+                .setTitle("Settings not applied")
+                .setMessage(problem)
+                .setPositiveButton("Change settings") { _, _ -> showSettings(d) }
+                .setNegativeButton("Discard changes", null)
+                .setOnDismissListener { hideSystemBars() }
+                .show()
+            return
+        }
+        val replay = parseSeconds(d.replayText)!!
+        val delay = parseSeconds(d.delayText)!!
+        if (captureChanged) {
+            prefs.cameraKey = d.cameraKey
+            prefs.width = d.width
+            prefs.height = d.height
+            prefs.fps = d.fps
+            prefs.quality = d.quality
+            // Restarting creates a new buffer anyway.
+            prefs.replaySeconds = replay
+            prefs.delaySeconds = delay
+            if (inReplay) exitReplay()
+            messageText.visibility = View.GONE
+            applyLiveUi()
+            restartPipeline()
+        } else {
+            applyDurations(replay, delay)
+        }
     }
 
     private fun sizeLabel(s: Size): String {

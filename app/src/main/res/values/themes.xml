@@ -10,16 +10,6 @@
         <item name="android:windowFullscreen">true</item>
     </style>
 
-    <style name="ModeButton" parent="Widget.Material3.Button.OutlinedButton">
-        <item name="android:layout_width">wrap_content</item>
-        <item name="android:layout_height">48dp</item>
-        <item name="android:insetTop">0dp</item>
-        <item name="android:insetBottom">0dp</item>
-        <item name="android:textSize">15sp</item>
-        <item name="android:textColor">#FFFFFF</item>
-        <item name="backgroundTint">@color/mode_button_bg</item>
-    </style>
-
     <style name="ReplayButton" parent="Widget.Material3.Button.TonalButton">
         <item name="android:layout_width">0dp</item>
         <item name="android:layout_height">56dp</item>
@@ -38,9 +28,18 @@
 
     <style name="LiveReplayButton" parent="Widget.Material3.Button">
         <item name="android:layout_width">168dp</item>
-        <item name="android:layout_height">128dp</item>
-        <item name="android:textSize">24sp</item>
-        <item name="android:gravity">center</item>
+        <item name="android:layout_height">56dp</item>
+        <item name="android:layout_margin">10dp</item>
+        <item name="android:textSize">15sp</item>
+        <item name="android:maxLines">1</item>
+        <item name="android:paddingStart">10dp</item>
+        <item name="android:paddingEnd">10dp</item>
+        <item name="iconPadding">6dp</item>
+        <item name="iconTint">#FFFFFF</item>
+        <!-- Shrinks the text for long lengths such as "REPLAY 600 s". -->
+        <item name="android:autoSizeTextType">uniform</item>
+        <item name="android:autoSizeMinTextSize">10sp</item>
+        <item name="android:autoSizeMaxTextSize">15sp</item>
         <item name="android:textStyle">bold</item>
         <item name="android:textColor">#FFFFFF</item>
         <item name="android:insetTop">0dp</item>

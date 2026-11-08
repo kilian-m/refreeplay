@@ -117,6 +117,15 @@ class ReplayController(context: Context, playerView: PlayerView, private val lis
         player.pause()
     }
 
+    /** Plays from [ms] (used to preview the part chosen for cutting). */
+    fun playFrom(ms: Long) {
+        handler.removeCallbacks(seekTimeout)
+        resetSeekState()
+        stepIndex = -1
+        player.seekTo(ms.coerceIn(0, durationMs))
+        player.play()
+    }
+
     fun togglePlay() {
         if (isPlaying) pause() else play()
     }
