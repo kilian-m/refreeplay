@@ -6,6 +6,7 @@ import android.media.MediaMuxer
 import android.os.SharedMemory
 import java.io.File
 import java.nio.ByteBuffer
+import kotlin.math.max
 import kotlin.math.min
 
 /** Index entry for one compressed (H.264) frame stored in the buffer's memory arena. */
@@ -78,7 +79,7 @@ class FrameRingBuffer {
     var capacityBytes = 0L
         private set
 
-    private fun maxFrameBytes(): Long = min(capacityBytes / 8, SEGMENT.toLong())
+    private fun maxFrameBytes(): Long = min(usableBytes / 8, SEGMENT.toLong())
 
     /** A view of the segment holding [offset], positioned there. */
     private fun view(offset: Long, size: Int): ByteBuffer {
@@ -114,15 +115,27 @@ class FrameRingBuffer {
 
     private var scratch = ByteArray(0)
 
-    /** True if frames inside the wanted duration had to be dropped because memory ran out. */
+    /** True if frames inside the wanted duration had to be dropped for lack of memory recently. */
+    val limitedByMemory: Boolean
+        get() = lastLimitedNs != 0L && System.nanoTime() - lastLimitedNs < 10_000_000_000L
+
     @Volatile
-    var limitedByMemory = false
+    private var lastLimitedNs = 0L
+
+    /**
+     * The part of the memory the circular log currently uses. It starts at the estimated need and
+     * grows (up to [capacityBytes]) when the real bitrate is higher, so the buffer still holds the
+     * whole duration. Memory beyond it is never touched, so it doesn't cost anything.
+     */
+    @Volatile
+    var usableBytes = 0L
         private set
 
-    /** (Re)allocates the memory and sets the duration. Discards all stored frames. */
+    /** Allocates fresh memory (pages are committed only when written) and sets the duration. Discards all stored frames. */
     @Synchronized
-    fun configure(capacity: Long, durationUs: Long, resetFormat: Boolean) {
-        if (capacity != capacityBytes || arenas.isEmpty()) {
+    fun configure(capacity: Long, usable: Long, durationUs: Long, resetFormat: Boolean) {
+        run {
+            // Always fresh memory: pages written for an earlier, longer buffer would stay in use otherwise.
             freeArena()
             val count = ((capacity + SEGMENT - 1) / SEGMENT).toInt()
             val newShms = ArrayList<SharedMemory>()
@@ -144,6 +157,7 @@ class FrameRingBuffer {
             capacityBytes = capacity
         }
         this.durationUs = durationUs
+        usableBytes = usable.coerceIn(min(capacityBytes, 16L shl 20), capacityBytes)
         if (resetFormat) format = null
         resetIndex()
     }
@@ -170,7 +184,7 @@ class FrameRingBuffer {
         awaitKey = false
         offsetUs = 0
         pins.clear()
-        limitedByMemory = false
+        lastLimitedNs = 0L
         generation++
     }
 
@@ -233,7 +247,7 @@ class FrameRingBuffer {
     private fun evictHead(newPts: Long): Boolean {
         val h = frames.firstOrNull() ?: return false
         if (h.ptsUs >= minPin()) return false
-        if (h.ptsUs > newPts - durationUs) limitedByMemory = true
+        if (h.ptsUs > newPts - durationUs) lastLimitedNs = System.nanoTime()
         frames.removeFirst()
         bytes -= h.size
         return true
@@ -242,14 +256,25 @@ class FrameRingBuffer {
     /** Finds room for [n] bytes, evicting the oldest frames if needed. Returns -1 if impossible. */
     private fun reserve(n: Int, newPts: Long): Long {
         var p = writePos
-        val segEnd = min((p / SEGMENT + 1) * SEGMENT, capacityBytes)
+        var limit = usableBytes
+        var segEnd = min((p / SEGMENT + 1) * SEGMENT, limit)
+        if (p + n > segEnd && segEnd >= limit && limit < capacityBytes) {
+            // About to wrap around while the oldest frame is still needed: the video needs more
+            // memory than estimated, so use more of the reserved memory instead of dropping it.
+            val head = frames.firstOrNull()
+            if (head != null && head.ptsUs > newPts - durationUs) {
+                limit = min(capacityBytes, max(limit + limit / 4, p + n))
+                usableBytes = limit
+                segEnd = min((p / SEGMENT + 1) * SEGMENT, limit)
+            }
+        }
         if (p + n > segEnd) {
             // Skip the rest of this segment (to the next one, or wrap around to the start):
             // frames still stored in the skipped part are the oldest ones and must go first.
             while (frames.isNotEmpty() && frames.first().offset in p until segEnd) {
                 if (!evictHead(newPts)) return -1
             }
-            p = if (segEnd >= capacityBytes) 0L else segEnd
+            p = if (segEnd >= limit) 0L else segEnd
         }
         while (frames.isNotEmpty()) {
             val h = frames.first()
@@ -327,7 +352,8 @@ class FrameRingBuffer {
         val copy = FrameRingBuffer()
         // Room for all frames, plus what may be left unused at the end of each segment.
         val slack = (s.totalBytes / SEGMENT + 2) * s.maxFrameSize
-        copy.configure(maxOf(s.totalBytes + slack, s.maxFrameSize * 8L + slack), Long.MAX_VALUE / 4, true)
+        val size = maxOf(s.totalBytes + slack, s.maxFrameSize * 8L + slack)
+        copy.configure(size, size, Long.MAX_VALUE / 4, true)
         copy.setFormat(s.format)
         val tmp = ByteArray(s.maxFrameSize)
         for (f in s.frames) {

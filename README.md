@@ -96,7 +96,8 @@ older version) are never changed automatically: each time the app is opened fres
 lets you change them or continue anyway. As a
 guide, 1080p/60 at "High" needs about 3 MB per second, so
 600 s need about 1.8 GB; at "Standard" or 30 fps it's less. If a busy scene needs more than
-estimated, the status line shows "⚠ memory full" and the buffer gets a little shorter.
+estimated, the buffer simply uses more memory, up to the safe limit; only if even that is not
+enough does the status line show "⚠ memory full" and the buffer gets a little shorter.
 
 ## Notes
 - Some phones, for example Samsung, don't officially offer 60 fps to third-party apps. ReFreePlay

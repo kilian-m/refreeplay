@@ -166,6 +166,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     private var lastFpsTime = 0L
     private var measuredFps = 0.0
 
+    /** Buffer generation in which the buffer was full once (status shows "ready" from then on). */
+    private var readyGeneration = -1
+
+    /** Testing only, see [applyIntentSettings]. */
+    private var estimateScale = 1f
+
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
             if (granted) startPipeline()
@@ -292,6 +298,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         if (ex.containsKey("quality")) prefs.quality = ex.getInt("quality")
         if (ex.containsKey("replay")) prefs.replaySeconds = ex.getFloat("replay")
         if (ex.containsKey("delay")) prefs.delaySeconds = ex.getFloat("delay")
+        // Testing only (not stored): scales the memory estimate, e.g. 0.5 to check that the buffer grows.
+        if (ex.containsKey("estimateScale")) estimateScale = ex.getFloat("estimateScale")
     }
 
     private fun logCapabilities() {
@@ -435,11 +443,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     /** Sizes the buffer. Discards the buffered video. */
     private fun configureBuffer(cfg: CaptureConfig, resetFormat: Boolean): Boolean {
         val seconds = activeBufferSeconds()
-        var capacity = min(BufferSizing.bytesFor(cfg.targetBitrate, seconds), BufferSizing.maxBytes(this))
+        // Reserve up to the safe maximum, but start with the estimated need; the buffer grows only if
+        // the real bitrate is higher (unused memory is never touched, so it costs nothing).
+        val estimate = (BufferSizing.bytesFor(cfg.targetBitrate, seconds) * estimateScale).toLong()
+        var capacity = BufferSizing.maxBytes(this)
         while (true) {
             try {
-                buffer.configure(capacity, (seconds * 1_000_000).toLong(), resetFormat)
-                Log.i(TAG, "buffer: %.1f s, %d MB".format(seconds, capacity shr 20))
+                buffer.configure(capacity, min(estimate, capacity), (seconds * 1_000_000).toLong(), resetFormat)
+                Log.i(TAG, "buffer: %.1f s, %d MB estimated, up to %d MB".format(seconds, min(estimate, capacity) shr 20, capacity shr 20))
                 encoder?.requestKeyFrame()
                 return true
             } catch (e: Throwable) {
@@ -746,8 +757,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             val frames = enc.framesEncoded
             if (lastFpsTime > 0) {
                 measuredFps = (frames - lastFrames) * 1000.0 / (now - lastFpsTime)
-                Log.d(TAG, "measured %.1f fps, buffer %.1f s, %d kB".format(
-                    measuredFps, buffer.bufferedUs() / 1e6, buffer.bufferedBytes() / 1000))
+                Log.d(TAG, "measured %.1f fps, buffer %.1f s, %d kB, using %d MB".format(
+                    measuredFps, buffer.bufferedUs() / 1e6, buffer.bufferedBytes() / 1000, buffer.usableBytes shr 20))
             }
             lastCaptured = camera.capturedFrames.get()
             lastFrames = frames
@@ -760,8 +771,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             val have = buffer.bufferedUs() / 1e6f
             val want = prefs.replaySeconds
             val parts = ArrayList<String>()
-            parts += if (have + 0.3f >= want) "Replay ready: last ${fmtSeconds(want)} s"
-            else "Recording… %d of %s s".format(have.toInt(), fmtSeconds(want))
+            // Once the buffer was full, stay "ready" (no flipping back to "Recording…"); if it holds
+            // a little less for a moment, show the real length instead.
+            if (have + 0.3f >= want) readyGeneration = buffer.generation
+            parts += when {
+                readyGeneration != buffer.generation ->
+                    "Recording… %d of %s s".format(have.toInt(), fmtSeconds(want))
+                have + 0.5f >= want -> "Replay ready: last ${fmtSeconds(want)} s"
+                else -> "Replay ready: last %d s".format(have.toInt())
+            }
             if (buffer.limitedByMemory) parts += "⚠ memory full"
             if (measuredFps > 0 && measuredFps < cfg.fps * 0.85) {
                 parts += "⚠ only %d of %d fps".format(measuredFps.roundToInt(), cfg.fps)
