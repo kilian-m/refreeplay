@@ -1386,15 +1386,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             if (replay != null && delay != null) {
                 val need = BufferSizing.bytesFor(br, BufferSizing.bufferSeconds(replay, delay))
                 val max = BufferSizing.maxBytes(this)
-                sb.append("Memory: needs ≈ %s of ≈ %s this phone can safely use".format(fmtBytes(need), fmtBytes(max)))
-                if (need > max) sb.append(" ⚠ too much")
-                sb.append(".\n")
+                sb.append("Memory ≈ %s of %s".format(fmtBytes(need), fmtBytes(max)))
+                if (need > max) sb.append("  ⚠ too much")
+                sb.append("  ·  ")
             }
-            sb.append("At these settings (≈ %.0f Mbit/s) up to ≈ %.0f s fit into memory."
-                .format(br / 1e6, min(BufferSizing.maxSeconds(this, br), BufferSizing.MAX_SECONDS)))
-            if (f.unofficial) {
-                sb.append("\nThis camera does not officially offer ${f.fps} fps. If the status line shows a lower measured rate, choose 30 fps.")
-            }
+            sb.append("max ≈ %.0f s".format(min(BufferSizing.maxSeconds(this, br), BufferSizing.MAX_SECONDS)))
             infoText.text = sb
         }
 

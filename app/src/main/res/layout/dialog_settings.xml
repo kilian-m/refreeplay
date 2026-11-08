@@ -110,13 +110,6 @@
         </LinearLayout>
 
         <TextView
-            style="@style/TextAppearance.Material3.BodySmall"
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:layout_marginTop="4dp"
-            android:text="Replay length: how much video is kept in memory and shown by REPLAY.\nDisplay delay: the screen shows the camera picture this many seconds late (0 = live). It can't be longer than the replay length.\nChanges are applied when you close this dialog." />
-
-        <TextView
             android:id="@+id/infoText"
             style="@style/TextAppearance.Material3.BodySmall"
             android:layout_width="match_parent"
