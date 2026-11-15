@@ -12,11 +12,11 @@ import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Hardware H.264 encoder fed by the camera through an input Surface.
- * Every compressed frame goes straight into the [FrameRingBuffer].
+ * Every compressed frame goes straight into the [FrameSink]: the buffer, or a stream to it.
  */
 class VideoEncoder(
     val config: CaptureConfig,
-    private val sink: FrameRingBuffer,
+    private val sink: FrameSink,
     private val onError: (String) -> Unit,
 ) {
     private val thread = HandlerThread("VideoEncoder").apply { start() }

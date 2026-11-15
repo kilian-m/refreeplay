@@ -73,7 +73,7 @@ class ClipIndex(val ptsUs: LongArray, val keys: BooleanArray)
  * one GOP (key frame to key frame) at a time, so the buffer always starts with a key frame.
  * Memory pages are only committed when they are first written.
  */
-class FrameRingBuffer {
+class FrameRingBuffer : FrameSink {
     private var shms: Array<SharedMemory> = emptyArray()
     private var arenas: Array<ByteBuffer> = emptyArray()
     var capacityBytes = 0L
@@ -189,7 +189,7 @@ class FrameRingBuffer {
     }
 
     @Synchronized
-    fun setFormat(f: MediaFormat) {
+    override fun setFormat(f: MediaFormat) {
         format = f
     }
 
@@ -209,7 +209,7 @@ class FrameRingBuffer {
 
     /** Stores one encoded frame; [src] is positioned at the frame data. */
     @Synchronized
-    fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean) {
+    override fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean) {
         if (arenas.isEmpty()) return
         if (frozen) return
         if (size <= 0 || size > maxFrameBytes()) {

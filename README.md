@@ -86,6 +86,7 @@ Changes are applied when you close the settings dialog.
 | Quality | Bitrate: Standard / High / Maximum. |
 | Replay length | 1 to 600 s: how much video is kept in memory. |
 | Display delay | 0 (live) up to the replay length. |
+| Test: loopback | Off by default. Prototype of a two-phone setup on one phone: the video goes through a local network connection into the buffer, and the live picture is decoded from what was received. The status line shows the bitrate and the transit time. |
 
 The buffer always holds exactly the replay length (plus up to half a second, because it's
 trimmed at key frames). The dialog shows how much memory the settings need and how much this
@@ -124,6 +125,7 @@ Camera2 ──┬──> SurfaceView (live preview)
 | `CameraCatalog.kt` | Lists cameras/lenses, resolutions and frame rates; picks defaults |
 | `CameraController.kt` | Camera2 session, zoom |
 | `VideoEncoder.kt` | Surface-input H.264 encoder that feeds the buffer |
+| `StreamLink.kt` | Loopback test: sends the encoder's output over a TCP connection into the buffer (sender, receiver, wire format) |
 | `FrameRingBuffer.kt` | Ring buffer in shared memory segments (freeze, pins for replays and saving), MP4 writer |
 | `VirtualMp4.kt` | Serves a replay to ExoPlayer as an MP4 that is never written: opens instantly at any length |
 | `DelayedViewer.kt` | Decodes the buffer with a fixed delay for the display delay |

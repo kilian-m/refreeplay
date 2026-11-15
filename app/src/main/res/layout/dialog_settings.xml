@@ -109,6 +109,13 @@
             </LinearLayout>
         </LinearLayout>
 
+        <CheckBox
+            android:id="@+id/cbLoopback"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Test: stream the video through a local connection (loopback)" />
+
         <TextView
             android:id="@+id/infoText"
             style="@style/TextAppearance.Material3.BodySmall"

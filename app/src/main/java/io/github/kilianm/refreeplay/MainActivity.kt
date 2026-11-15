@@ -35,6 +35,7 @@ import android.view.ViewConfiguration
 import android.view.WindowManager
 import android.widget.AdapterView
 import android.widget.ArrayAdapter
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
@@ -122,6 +123,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     // Capture pipeline
     private var config: CaptureConfig? = null
     private var encoder: VideoEncoder? = null
+
+    // Loopback test (see Prefs.loopback): the encoder's output goes through [sender] and a local
+    // connection to [receiver], which fills the buffer, as it would between two phones.
+    private var sender: StreamSender? = null
+    private var receiver: StreamReceiver? = null
+    private var lastLinkBytes = 0L
+    private var linkMbit = 0.0
     private var wantRunning = false
     private var cameraActive = false
     private var keepBufferWhilePaused = false
@@ -298,6 +306,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         if (ex.containsKey("quality")) prefs.quality = ex.getInt("quality")
         if (ex.containsKey("replay")) prefs.replaySeconds = ex.getFloat("replay")
         if (ex.containsKey("delay")) prefs.delaySeconds = ex.getFloat("delay")
+        if (ex.containsKey("loopback")) prefs.loopback = ex.getBoolean("loopback") // --ez loopback true
         // Testing only (not stored): scales the memory estimate, e.g. 0.5 to check that the buffer grows.
         if (ex.containsKey("estimateScale")) estimateScale = ex.getFloat("estimateScale")
     }
@@ -353,8 +362,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         viewer.stop()
         replay.release()
         camera.shutdown()
-        encoder?.release()
-        encoder = null
+        releaseEncoder()
+        receiver?.close()
+        receiver = null
         buffer.release()
         io.shutdown()
     }
@@ -413,20 +423,37 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         if (!surfaceReady || surfaceW != cfg.previewWidth || surfaceH != cfg.previewHeight) return
         var enc = encoder
         if (enc != null && enc.config != cfg) {
-            enc.release()
+            releaseEncoder()
             enc = null
-            encoder = null
         }
         if (enc == null) {
+            // Loopback test: end the previous stream first, so none of its frames reach the new buffer.
+            var streamId = 0
+            if (prefs.loopback) {
+                val r = receiver ?: try {
+                    StreamReceiver(buffer).also { receiver = it }
+                } catch (e: Exception) {
+                    showMessage("Loopback test: cannot open a local connection (${e.message}).")
+                    return
+                }
+                streamId = r.expectStream()
+            } else {
+                receiver?.close()
+                receiver = null
+            }
             if (!configureBuffer(cfg, resetFormat = true)) return
+            val link = receiver?.let { StreamSender(StreamReceiver.HOST, it.port, streamId) }
             enc = try {
                 lateinit var created: VideoEncoder
-                created = VideoEncoder(cfg, buffer) { msg -> ui.post { onEncoderError(created, msg) } }
+                created = VideoEncoder(cfg, link ?: buffer) { msg -> ui.post { onEncoderError(created, msg) } }
                 created
             } catch (e: Exception) {
+                link?.close()
                 showMessage("The video encoder cannot record ${cfg.width}×${cfg.height} at ${cfg.fps} fps.\nPlease choose other settings.")
                 return
             }
+            link?.onKeyFrameRequest = enc::requestKeyFrame
+            sender = link
             enc.start()
             encoder = enc
         }
@@ -451,7 +478,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             try {
                 buffer.configure(capacity, min(estimate, capacity), (seconds * 1_000_000).toLong(), resetFormat)
                 Log.i(TAG, "buffer: %.1f s, %d MB estimated, up to %d MB".format(seconds, min(estimate, capacity) shr 20, capacity shr 20))
-                encoder?.requestKeyFrame()
+                requestKeyFrame()
                 return true
             } catch (e: Throwable) {
                 Log.w(TAG, "buffer allocation of ${capacity shr 20} MB failed", e)
@@ -473,9 +500,27 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     private fun stopCapture() {
         stopViewer()
         pauseCamera()
+        releaseEncoder()
+    }
+
+    private fun releaseEncoder() {
         encoder?.release()
         encoder = null
+        sender?.close()
+        sender = null
     }
+
+    /**
+     * Asks the encoder for a key frame. In the loopback test the request travels back over the
+     * connection, as it would from the referee's phone.
+     */
+    private fun requestKeyFrame() {
+        val r = receiver
+        if (r != null) r.requestKeyFrame() else encoder?.requestKeyFrame()
+    }
+
+    /** The live screen shows video decoded from the buffer: with a display delay, and in the loopback test. */
+    private fun liveFromBuffer(): Boolean = prefs.delaySeconds > 0f || prefs.loopback
 
     private fun stopPipeline() {
         wantRunning = false
@@ -631,9 +676,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         btnBig.text = "REPLAY"
         delayBadge.text = "⏱ DELAY ${fmtSeconds(prefs.delaySeconds)} s"
         if (inReplay) return
-        delayView.visibility = if (delayed) View.VISIBLE else View.GONE
+        val decoded = liveFromBuffer()
+        delayView.visibility = if (decoded) View.VISIBLE else View.GONE
         delayBadge.visibility = if (delayed) View.VISIBLE else View.GONE
-        setPreviewHidden(delayed)
+        setPreviewHidden(decoded)
         if (!delayed && showingDelayWait) {
             showingDelayWait = false
             messageText.visibility = View.GONE
@@ -671,7 +717,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     }
 
     private fun maybeStartViewer() {
-        if (prefs.delaySeconds <= 0f || inReplay || viewerRunning) return
+        if (!liveFromBuffer() || inReplay || viewerRunning) return
         val surface = delaySurface ?: return
         if (encoder == null || !cameraActive) return
         viewer.start(surface, (prefs.delaySeconds * 1e9).toLong())
@@ -760,6 +806,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
                 Log.d(TAG, "measured %.1f fps, buffer %.1f s, %d kB, using %d MB".format(
                     measuredFps, buffer.bufferedUs() / 1e6, buffer.bufferedBytes() / 1000, buffer.usableBytes shr 20))
             }
+            receiver?.let { r ->
+                val received = r.bytesReceived.get()
+                if (lastFpsTime > 0) {
+                    linkMbit = max(0L, received - lastLinkBytes) * 8.0 / 1000.0 / (now - lastFpsTime)
+                    Log.d(TAG, "loopback: %.1f Mbit/s, transit %.1f ms, %d frames received, %d overflows".format(
+                        linkMbit, r.transitMs, r.framesReceived.get(), sender?.overflows?.get() ?: 0))
+                }
+                lastLinkBytes = received
+            }
             lastCaptured = camera.capturedFrames.get()
             lastFrames = frames
             lastFpsTime = now
@@ -786,6 +841,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             }
             val zoom = camera.zoomRatio
             if (abs(zoom - 1f) > 0.01f) parts += "Zoom %.1f×".format(zoom)
+            receiver?.let { r ->
+                parts += if (r.connected) "⇄ loopback %.0f Mbit/s, %.0f ms".format(linkMbit, r.transitMs)
+                else "⇄ loopback: not connected"
+            }
             "● " + parts.joinToString("  ·  ")
         }
     }
@@ -809,7 +868,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         }
         val freeze = !review
         if (freeze) buffer.setFrozen(true)
-        if (review) stopViewer()
+        stopViewer()
         showingDelayWait = false
         val rotation = cfg.rotationFor(displayRotationDegrees())
         // The replay is played straight from the buffer (no file is written), so it opens at once.
@@ -828,7 +887,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         } catch (e: Exception) {
             snap.release()
             if (freeze) resumeRecording()
-            if (review) maybeStartViewer()
+            maybeStartViewer()
             showMessage("Could not prepare replay: ${e.message}")
             return
         }
@@ -840,7 +899,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     private fun resumeRecording() {
         buffer.setFrozen(false)
-        encoder?.requestKeyFrame()
+        requestKeyFrame()
     }
 
     private fun enterReplay(mp4: VirtualMp4, rotation: Int, seconds: Double, froze: Boolean) {
@@ -1328,6 +1387,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         val quality: Int,
         val replayText: String,
         val delayText: String,
+        val loopback: Boolean,
     )
 
     /**
@@ -1347,6 +1407,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         val spQuality = view.findViewById<Spinner>(R.id.spQuality)
         val etReplay = view.findViewById<EditText>(R.id.etReplay)
         val etDelay = view.findViewById<EditText>(R.id.etDelay)
+        val cbLoopback = view.findViewById<CheckBox>(R.id.cbLoopback)
         val infoText = view.findViewById<TextView>(R.id.infoText)
 
         fun adapter(items: List<String>) =
@@ -1371,6 +1432,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
                 quality = spQuality.selectedItemPosition,
                 replayText = etReplay.text.toString(),
                 delayText = etDelay.text.toString(),
+                loopback = cbLoopback.isChecked,
             )
         }
 
@@ -1418,6 +1480,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
         etReplay.setText(initial?.replayText ?: fmtSeconds(prefs.replaySeconds))
         etDelay.setText(initial?.delayText ?: fmtSeconds(prefs.delaySeconds))
+        cbLoopback.isChecked = initial?.loopback ?: prefs.loopback
         spCamera.adapter = adapter(cams.map { it.label })
         val camKey = initial?.cameraKey ?: cur?.camera?.key ?: prefs.cameraKey
         spCamera.setSelection(cams.indexOfFirst { it.key == camKey }.coerceAtLeast(0))
@@ -1499,6 +1562,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             quality = prefs.quality,
             replayText = fmtSeconds(prefs.replaySeconds),
             delayText = fmtSeconds(prefs.delaySeconds),
+            loopback = prefs.loopback,
         )
         val problem = settingsProblem(stored) ?: return
         MaterialAlertDialogBuilder(this)
@@ -1513,7 +1577,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     /** Applies the settings from the dialog, or explains why they can't be used. */
     private fun applySettings(d: SettingsDraft) {
         val captureChanged = d.cameraKey != (config?.camera?.key ?: prefs.cameraKey) ||
-            d.width != prefs.width || d.height != prefs.height || d.fps != prefs.fps || d.quality != prefs.quality
+            d.width != prefs.width || d.height != prefs.height || d.fps != prefs.fps || d.quality != prefs.quality ||
+            d.loopback != prefs.loopback
         if (!captureChanged && parseSeconds(d.replayText) == prefs.replaySeconds &&
             parseSeconds(d.delayText) == prefs.delaySeconds
         ) return // nothing changed
@@ -1536,6 +1601,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             prefs.height = d.height
             prefs.fps = d.fps
             prefs.quality = d.quality
+            prefs.loopback = d.loopback
             // Restarting creates a new buffer anyway.
             prefs.replaySeconds = replay
             prefs.delaySeconds = delay

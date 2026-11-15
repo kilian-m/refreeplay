@@ -43,6 +43,14 @@ class Prefs(context: Context) {
     var playbackSpeed: Float
         get() = sp.getFloat("speed", 1f)
         set(v) = sp.edit().putFloat("speed", v).apply()
+
+    /**
+     * Test of the two-phone setup on one phone: the video goes through a local network connection
+     * into the buffer, and the live picture is decoded from what was received.
+     */
+    var loopback: Boolean
+        get() = sp.getBoolean("loopback", false)
+        set(v) = sp.edit().putBoolean("loopback", v).apply()
 }
 
 /** How much memory a buffer of a given length needs, and how much this phone can give. */
