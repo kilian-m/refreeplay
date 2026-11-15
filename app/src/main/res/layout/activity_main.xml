@@ -348,14 +348,6 @@
                 android:clickable="false"
                 android:focusable="false" />
         </FrameLayout>
-
-        <TextView
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:text="Drag the two handles; the video shows the frame at the handle. ▶ Play (or double-tap the video) shows exactly the part that will be saved; tap the video to hide this panel. The start snaps to the nearest earlier key frame (at most 0.5 s)."
-            android:textColor="#BBBBBB"
-            android:textSize="12sp" />
-
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"

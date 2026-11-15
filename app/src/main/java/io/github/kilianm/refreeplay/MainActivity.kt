@@ -1035,6 +1035,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         snapTrimStart()
         val v = trimSlider.values
         trimPlayEndMs = (v[1] * 1000).toLong()
+        replay.setSpeed(1f) // the preview always plays at normal speed
         replay.playFrom((v[0] * 1000).toLong())
         btnTrimPlay.text = "❚❚ Stop"
     }
@@ -1043,6 +1044,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         replay.pause()
         if (trimPlayEndMs < 0) return
         trimPlayEndMs = -1
+        replay.setSpeed(prefs.playbackSpeed) // back to the speed chosen on the replay screen
         btnTrimPlay.text = "▶︎ Play"
     }
 
