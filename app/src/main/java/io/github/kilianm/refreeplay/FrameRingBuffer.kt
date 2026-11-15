@@ -19,6 +19,12 @@ class FrameRef(
     val arrivalNs: Long,
     /** Size in MP4 (length-prefixed) form, see [Avc]. */
     val avccSize: Int,
+    /**
+     * When the frame left its encoder, on this phone's clock (System.nanoTime()). For a frame from
+     * another phone this is earlier than [arrivalNs] by the time it travelled. It places the
+     * frames of two cameras on one timeline.
+     */
+    val timeNs: Long,
 )
 
 /** Frames for one clip, starting at a key frame. Pinned in its buffer until [release]. */
@@ -34,6 +40,25 @@ class ReplaySnapshot internal constructor(
     val endPtsUs: Long get() = frames.last().ptsUs
     val maxFrameSize: Int = frames.maxOf { it.size }
     val totalBytes: Long = frames.sumOf { it.size.toLong() }
+
+    /**
+     * What to add to a frame's timestamp (in ns) to get the time it left its encoder on this
+     * phone's clock. Taken from the last frames of the clip, where a replay matters most: earlier
+     * interruptions (a replay that was watched, a lost connection) are cut out of the timestamps
+     * and would shift the result.
+     */
+    fun anchorNs(): Long {
+        val last = frames.last()
+        val lastDiff = last.timeNs - last.ptsUs * 1000
+        val diffs = ArrayList<Long>()
+        for (i in frames.indices.reversed()) {
+            val d = frames[i].timeNs - frames[i].ptsUs * 1000
+            if (kotlin.math.abs(d - lastDiff) > 300_000_000L || diffs.size >= 60) break
+            diffs.add(d)
+        }
+        diffs.sort()
+        return diffs[diffs.size / 2]
+    }
 
     /** Copies a frame of this snapshot into [dst]. Returns false if the buffer was reset. */
     fun read(f: FrameRef, dst: ByteArray): Boolean = source.read(f, generation, dst)
@@ -216,9 +241,12 @@ class FrameRingBuffer : FrameSink {
         if (frames.isNotEmpty()) awaitKey = true
     }
 
-    /** Stores one encoded frame; [src] is positioned at the frame data. */
+    /**
+     * Stores one encoded frame; [src] is positioned at the frame data. [encodedNs] is when it left
+     * its encoder on this phone's clock, or 0 for "just now".
+     */
     @Synchronized
-    override fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean) {
+    override fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean, encodedNs: Long) {
         if (arenas.isEmpty()) return
         if (frozen) return
         if (size <= 0 || size > maxFrameBytes()) {
@@ -246,7 +274,8 @@ class FrameRingBuffer : FrameSink {
         if (scratch.size < size) scratch = ByteArray(size + (size shr 2))
         src.get(scratch, 0, size)
         view(pos, size).put(scratch, 0, size)
-        frames.addLast(FrameRef(pos, size, pts, isKey, System.nanoTime(), Avc.avccSize(scratch, size)))
+        val now = System.nanoTime()
+        frames.addLast(FrameRef(pos, size, pts, isKey, now, Avc.avccSize(scratch, size), if (encodedNs != 0L) encodedNs else now))
         bytes += size
         trimByTime()
     }
@@ -370,7 +399,7 @@ class FrameRingBuffer : FrameSink {
                 copy.release()
                 return null
             }
-            copy.add(ByteBuffer.wrap(tmp, 0, f.size), f.size, f.ptsUs, f.isKey)
+            copy.add(ByteBuffer.wrap(tmp, 0, f.size), f.size, f.ptsUs, f.isKey, f.timeNs)
         }
         val snap = copy.snapshot(Long.MAX_VALUE / 4)
         if (snap == null || snap.frames.size != s.frames.size) {

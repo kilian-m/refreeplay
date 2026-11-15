@@ -6,11 +6,10 @@ import android.util.Log
 import android.view.Surface
 
 /**
- * Continuously shows what the camera recorded [delayNs] ago: decodes frames from the
- * [FrameRingBuffer] and displays each one exactly `delay` after it was recorded.
+ * Continuously shows what the camera recorded a set time ago: decodes frames from a
+ * [FrameRingBuffer] and displays each one exactly that delay after it arrived there.
  */
 class DelayedViewer(
-    private val buffer: FrameRingBuffer,
     /** Seconds until the delayed picture starts, or null while it is playing. Called on the viewer thread. */
     private val onStatus: (Double?) -> Unit,
 ) {
@@ -25,10 +24,11 @@ class DelayedViewer(
     private var running = false
     private var thread: Thread? = null
 
-    fun start(surface: Surface, delayNs: Long) {
+    /** Shows the video of [buffer] on [surface], [delayNs] late (0 = as it arrives). */
+    fun start(buffer: FrameRingBuffer, surface: Surface, delayNs: Long) {
         stop()
         running = true
-        thread = Thread({ loop(surface, delayNs) }, "DelayedViewer").apply { start() }
+        thread = Thread({ loop(buffer, surface, delayNs) }, "DelayedViewer").apply { start() }
     }
 
     fun stop() {
@@ -37,7 +37,7 @@ class DelayedViewer(
         thread = null
     }
 
-    private fun loop(surface: Surface, delayNs: Long) {
+    private fun loop(buffer: FrameRingBuffer, surface: Surface, delayNs: Long) {
         var codec: MediaCodec? = null
         var gen = -1
         var lastPts = Long.MIN_VALUE

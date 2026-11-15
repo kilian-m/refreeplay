@@ -44,28 +44,22 @@ class Prefs(context: Context) {
         get() = sp.getFloat("speed", 1f)
         set(v) = sp.edit().putFloat("speed", v).apply()
 
-    /**
-     * Test of the two-phone setup on one phone: the video goes through a local network connection
-     * into the buffer, and the live picture is decoded from what was received.
-     */
-    var loopback: Boolean
-        get() = sp.getBoolean("loopback", false)
-        set(v) = sp.edit().putBoolean("loopback", v).apply()
-
-    /** What this phone does: [MODE_SINGLE], [MODE_CAMERA] or [MODE_REFEREE]. */
+    /** What this phone does: [MODE_MAIN] or [MODE_CAMERA]. (An earlier version stored 2 for a referee phone, now a main phone.) */
     var mode: Int
-        get() = sp.getInt("mode", MODE_SINGLE).coerceIn(MODE_SINGLE, MODE_REFEREE)
+        get() = if (sp.getInt("mode", MODE_MAIN) == MODE_CAMERA) MODE_CAMERA else MODE_MAIN
         set(v) = sp.edit().putInt("mode", v).apply()
 
+    /** Tells the main phone which camera phone this is, also after reconnecting. Made up once per installation. */
+    val deviceId: String
+        get() = sp.getString("deviceId", null)
+            ?: java.util.UUID.randomUUID().toString().also { sp.edit().putString("deviceId", it).apply() }
+
     companion object {
-        /** Camera and replay on this phone. */
-        const val MODE_SINGLE = 0
+        /** Camera and replay on this phone; camera phones can be added as more cameras. */
+        const val MODE_MAIN = 0
 
-        /** Camera only: the video is sent to a referee phone. */
+        /** Camera only: the video is sent to a main phone, which also sets the camera. */
         const val MODE_CAMERA = 1
-
-        /** Replay only: the video comes from a camera phone. */
-        const val MODE_REFEREE = 2
     }
 }
 

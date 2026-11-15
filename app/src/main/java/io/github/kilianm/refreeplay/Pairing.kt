@@ -29,15 +29,15 @@ import java.net.Inet4Address
 import java.net.NetworkInterface
 
 /**
- * Everything the camera phone needs to reach the referee phone: the referee's hotspot and where
- * its [StreamReceiver] listens. The referee phone shows it as a QR code; the camera phone scans it.
+ * Everything the camera phone needs to reach the main phone: the main phone's hotspot and where
+ * its [StreamReceiver] listens. The main phone shows it as a QR code; the camera phone scans it.
  */
 data class PairingInfo(
     val ssid: String,
     val passphrase: String,
     /** [WPA2], [WPA3] or [OPEN]. */
     val security: String,
-    /** Addresses of the referee phone to try, after the hotspot's own gateway address. */
+    /** Addresses of the main phone to try, after the hotspot's own gateway address. */
     val hosts: List<String>,
     val port: Int,
     val token: String,
@@ -80,7 +80,7 @@ data class PairingInfo(
 }
 
 /**
- * Referee phone: opens a Wi-Fi hotspot that only serves this app (no internet is shared), for the
+ * Main phone: opens a Wi-Fi hotspot that only serves this app (no internet is shared), for the
  * camera phone to join. Android chooses its name and password; they are different every time.
  */
 class HotspotHost(context: Context) {
@@ -171,7 +171,7 @@ class HotspotHost(context: Context) {
     }
 }
 
-/** Camera phone: joins the referee phone's hotspot. Android asks the user to confirm the connection. */
+/** Camera phone: joins the main phone's hotspot. Android asks the user to confirm the connection. */
 class HotspotClient(context: Context) {
     enum class State { JOINED, LOST, UNAVAILABLE }
 
@@ -182,7 +182,7 @@ class HotspotClient(context: Context) {
     private var callback: ConnectivityManager.NetworkCallback? = null
     private var wifiLock: WifiManager.WifiLock? = null
 
-    /** The hotspot's network while joined. Connections to the referee phone must be opened on it. */
+    /** The hotspot's network while joined. Connections to the main phone must be opened on it. */
     @Volatile
     var network: Network? = null
         private set
@@ -192,8 +192,12 @@ class HotspotClient(context: Context) {
     var gateway: String? = null
         private set
 
-    /** Asks Android to join the hotspot. [onState] is called on the main thread. */
-    fun join(info: PairingInfo, onState: (State) -> Unit) {
+    /**
+     * Asks Android to join the hotspot. [onState] is called on the main thread. With [timeoutMs],
+     * the attempt ends as [State.UNAVAILABLE] after that time; without, it waits (the first time
+     * Android asks the user, who may take a while).
+     */
+    fun join(info: PairingInfo, timeoutMs: Int = 0, onState: (State) -> Unit) {
         leave()
         val specifier = WifiNetworkSpecifier.Builder().setSsid(info.ssid).apply {
             when (info.security) {
@@ -235,7 +239,7 @@ class HotspotClient(context: Context) {
             }
         }
         callback = cb
-        cm.requestNetwork(request, cb, main)
+        if (timeoutMs > 0) cm.requestNetwork(request, cb, main, timeoutMs) else cm.requestNetwork(request, cb, main)
     }
 
     /** Keeps Wi-Fi out of its power-saving mode, which delays packets. */

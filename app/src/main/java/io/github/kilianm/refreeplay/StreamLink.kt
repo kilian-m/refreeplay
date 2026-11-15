@@ -8,7 +8,6 @@ import java.io.ByteArrayOutputStream
 import java.io.DataInputStream
 import java.io.DataOutputStream
 import java.io.IOException
-import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.nio.ByteBuffer
@@ -23,11 +22,14 @@ import kotlin.concurrent.withLock
 interface FrameSink {
     fun setFormat(f: MediaFormat)
 
-    /** Takes one encoded frame; [src] is positioned at the frame data. */
-    fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean)
+    /**
+     * Takes one encoded frame; [src] is positioned at the frame data. [encodedNs] is when the frame
+     * left its encoder, on this phone's clock (System.nanoTime()); 0 means now.
+     */
+    fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean, encodedNs: Long = 0L)
 }
 
-/** What the referee side must know about the video, besides the codec format. */
+/** What the main phone must know about the video, besides the codec format. */
 data class StreamMeta(
     val width: Int,
     val height: Int,
@@ -45,26 +47,55 @@ data class StreamMeta(
 }
 
 /**
- * The video stream between the recording side ([StreamSender]) and the referee side
- * ([StreamReceiver]), over one TCP connection that the sender opens. All numbers are big-endian.
+ * The video stream between a camera phone ([StreamSender]) and the main phone ([StreamReceiver]),
+ * over one TCP connection that the sender opens. All numbers are big-endian.
  *
- * Sender to receiver: [MAGIC], the receiver's token (UTF), then messages:
+ * Sender to receiver: [MAGIC], the receiver's token, the sender's id and its name (all UTF), then
+ * messages:
  * - [MSG_META], int length, a [StreamMeta] (first message, and again when the camera is turned)
+ * - [MSG_CAPS], int length, UTF-8 text: what the cameras can do and what is set (see CameraRemote)
  * - [MSG_FORMAT], the encoder's output format (see [writeFormat])
  * - [MSG_FRAME], long ptsUs, long sentNs, byte flags ([FLAG_KEY]), int size, the frame data
  * - [MSG_PING] while there is nothing else to send, so the receiver can tell a quiet connection
  *   from a dead one
+ * - [MSG_TIME], long t0, long t1: the answer to [CTRL_TIME], with the sender's clock t1
  *
- * Receiver to sender, one byte each: [CTRL_KEY_FRAME] asks for a key frame as soon as possible.
+ * Receiver to sender:
+ * - [CTRL_KEY_FRAME] asks for a key frame as soon as possible
+ * - [CTRL_TIME], long t0 (the receiver's clock) asks for the sender's clock. From the answers the
+ *   receiver works out how the two clocks differ, to place the frames on its own timeline.
+ * - [CTRL_CONFIG], int length, UTF-8 text: the camera settings to use (see CameraRemote)
  */
 object StreamProtocol {
-    const val MAGIC = 0x52465032 // "RFP2"
+    const val MAGIC = 0x52465033 // "RFP3"
     const val MSG_FORMAT = 1
     const val MSG_FRAME = 2
     const val MSG_META = 3
     const val MSG_PING = 4
+    const val MSG_TIME = 5
+    const val MSG_CAPS = 6
     const val FLAG_KEY = 1
     const val CTRL_KEY_FRAME = 1
+    const val CTRL_TIME = 2
+    const val CTRL_CONFIG = 3
+
+    /** Longest text message, in bytes. */
+    private const val MAX_TEXT = 1 shl 18
+
+    /** A complete text message of the given type. */
+    fun textPacket(type: Int, text: String): ByteArray {
+        val bytes = text.toByteArray(Charsets.UTF_8)
+        return ByteBuffer.allocate(5 + bytes.size).put(type.toByte()).putInt(bytes.size).put(bytes).array()
+    }
+
+    /** Reads what follows the type byte of a text message. */
+    fun readText(inp: DataInputStream): String {
+        val n = inp.readInt()
+        if (n < 0 || n > MAX_TEXT) throw IOException("bad text message")
+        val bytes = ByteArray(n)
+        inp.readFully(bytes)
+        return String(bytes, Charsets.UTF_8)
+    }
     const val FRAME_HEADER = 1 + 8 + 8 + 1 + 4
     const val MAX_FRAME = 32 shl 20
 
@@ -172,7 +203,9 @@ object StreamProtocol {
 }
 
 /**
- * Recording side: sends everything the encoder produces to a [StreamReceiver].
+ * Camera phone: sends everything the encoder produces to the main phone's [StreamReceiver], and
+ * takes its requests. [id] tells the receiver which camera phone this is, also after reconnecting;
+ * [name] is shown to the user.
  *
  * [connect] opens the connection (it is called again after every failure, so it may fail while
  * the other end is not known or not reachable yet). Frames wait in a queue for a writer thread,
@@ -183,6 +216,8 @@ object StreamProtocol {
  */
 class StreamSender(
     meta: StreamMeta,
+    private val id: String,
+    private val name: String,
     private val connect: () -> Link,
 ) : FrameSink {
     /** An open connection and the token its receiver expects. */
@@ -193,6 +228,10 @@ class StreamSender(
     /** Called (on any thread) when the stream needs a key frame. */
     @Volatile
     var onKeyFrameRequest: (() -> Unit)? = null
+
+    /** Called (on a connection thread) with the camera settings the main phone wants, see CameraRemote. */
+    @Volatile
+    var onConfigRequest: ((String) -> Unit)? = null
 
     /** How often waiting frames had to be dropped because the connection was too slow. */
     val overflows = AtomicLong()
@@ -206,6 +245,7 @@ class StreamSender(
     private val changed = lock.newCondition()
     private val queue = ArrayDeque<Packet>()
     private var metaPacket = StreamProtocol.metaPacket(meta)
+    private var capsPacket: ByteArray? = null
     private var formatPacket: ByteArray? = null
     private var awaitKey = true
     private var keyRequested = false
@@ -235,6 +275,18 @@ class StreamSender(
         }
     }
 
+    /** Tells the receiver what this phone's cameras can do and what is set (see CameraRemote). */
+    fun setCapabilities(json: String) {
+        val packet = StreamProtocol.textPacket(StreamProtocol.MSG_CAPS, json)
+        lock.withLock {
+            capsPacket = packet
+            if (connected) {
+                queue.addLast(Packet(packet, 0, false))
+                changed.signalAll()
+            }
+        }
+    }
+
     override fun setFormat(f: MediaFormat) {
         val bytes = ByteArrayOutputStream()
         DataOutputStream(bytes).use {
@@ -251,7 +303,7 @@ class StreamSender(
         }
     }
 
-    override fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean) {
+    override fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean, encodedNs: Long) {
         if (size <= 0 || size > StreamProtocol.MAX_FRAME) return
         var needKey = false
         var stalled = false
@@ -304,13 +356,15 @@ class StreamSender(
                 DataOutputStream(hello).use {
                     it.writeInt(StreamProtocol.MAGIC)
                     it.writeUTF(link.token)
+                    it.writeUTF(id)
+                    it.writeUTF(name)
                 }
                 val first = lock.withLock {
                     queue.clear()
                     awaitKey = true
                     keyRequested = true // requested below
                     connected = true
-                    listOfNotNull(metaPacket, formatPacket)
+                    listOfNotNull(metaPacket, capsPacket, formatPacket)
                 }
                 failing = false
                 lastProgressNs = System.nanoTime()
@@ -346,11 +400,26 @@ class StreamSender(
     /** Reads the receiver's requests until the connection ends. */
     private fun readControl(s: Socket) {
         try {
-            val inp = s.getInputStream()
+            val inp = DataInputStream(s.getInputStream())
             while (true) {
                 when (inp.read()) {
                     -1 -> break
                     StreamProtocol.CTRL_KEY_FRAME -> onKeyFrameRequest?.invoke()
+                    StreamProtocol.CTRL_CONFIG -> StreamProtocol.readText(inp).let { onConfigRequest?.invoke(it) }
+                    StreamProtocol.CTRL_TIME -> {
+                        val bytes = ByteBuffer.allocate(17)
+                            .put(StreamProtocol.MSG_TIME.toByte())
+                            .putLong(inp.readLong())
+                            .putLong(System.nanoTime())
+                            .array()
+                        // In front of the waiting frames: the answer must not be held up.
+                        lock.withLock {
+                            if (connected) {
+                                queue.addFirst(Packet(bytes, 0, false))
+                                changed.signalAll()
+                            }
+                        }
+                    }
                 }
             }
         } catch (_: IOException) {
@@ -379,79 +448,113 @@ class StreamSender(
     }
 }
 
+/** Hands everything to two sinks. Testing only: lets a phone keep its video and send it to itself. */
+class TeeSink(private val first: FrameSink, private val second: FrameSink) : FrameSink {
+    override fun setFormat(f: MediaFormat) {
+        first.setFormat(f)
+        second.setFormat(f)
+    }
+
+    override fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean, encodedNs: Long) {
+        first.add(src.duplicate(), size, rawPtsUs, isKey, encodedNs)
+        second.add(src, size, rawPtsUs, isKey, encodedNs)
+    }
+}
+
 /**
- * Referee side: accepts the connection of a [StreamSender] and puts the received frames into [sink].
+ * Main phone: accepts the connections of camera phones ([StreamSender]) and hands their frames to
+ * the sinks the [listener] names.
  *
- * Only a sender that knows the [token] is accepted. With [local] set, it listens for connections
- * from this device only (loopback test); otherwise on all of the device's networks.
- *
- * A new connection replaces the current one: after a Wi-Fi dropout the old connection can look
- * alive for a long time, and the sender's new one must not wait behind it.
+ * Only a sender that knows the [token] is accepted. Every camera phone introduces itself with an
+ * id. A new connection with the same id replaces the old one: after a Wi-Fi dropout the old
+ * connection can look alive for a long time, and the sender's new one must not wait behind it.
  */
-class StreamReceiver(
-    private val sink: FrameSink,
-    val local: Boolean,
-    private val listener: Listener? = null,
-) {
+class StreamReceiver(private val listener: Listener) {
+
+    /** A camera phone that has connected at least once. */
+    class Peer internal constructor(val id: String, val name: String) {
+        val framesReceived = AtomicLong()
+        val bytesReceived = AtomicLong()
+
+        @Volatile
+        var connected = false
+            internal set
+
+        /** Travel time of the clock comparison in use, in ms; -1 while the clocks are not compared yet. */
+        @Volatile
+        var clockRoundTripMs = -1.0
+            internal set
+
+        // The rest is guarded by the receiver's lock.
+        internal var socket: Socket? = null
+        internal var sink: FrameSink? = null
+
+        /** Travel time (ns) and clock offset (ns) of the last comparisons. */
+        internal val clockSamples = ArrayDeque<LongArray>()
+
+        /**
+         * How far this camera phone's clock is ahead of the main phone's (System.nanoTime() on
+         * both), or [UNKNOWN] until it was measured. Each comparison can be off by half the time
+         * its question and answer travelled, so the fastest of the last [CLOCK_SAMPLES] counts.
+         */
+        @Volatile
+        internal var clockOffsetNs = UNKNOWN
+    }
+
+    /** All calls come on a connection's own thread. */
     interface Listener {
         /**
-         * A stream starts (after every connect). Called on the receiver thread; when it returns,
-         * [sink] must be ready for the frames of this stream, including its format.
+         * A stream starts (after every connect). Returns where its frames go, already prepared
+         * for this video and its format, or null if the stream is not wanted.
          */
-        fun onStreamFormat(meta: StreamMeta, format: MediaFormat)
+        fun onStreamFormat(peer: Peer, meta: StreamMeta, format: MediaFormat): FrameSink?
 
-        /** The stream info was received or changed, e.g. the camera was turned. Called on the receiver thread. */
-        fun onStreamMeta(meta: StreamMeta)
+        /** The stream info was received or changed, e.g. the camera was turned. */
+        fun onStreamMeta(peer: Peer, meta: StreamMeta)
+
+        /** The camera phone told what its cameras can do and what is set (JSON, see CameraRemote). */
+        fun onCapabilities(peer: Peer, json: String)
     }
 
-    // The loopback address is spelled out: InetAddress.getLoopbackAddress() is ::1 on Android.
-    private val server =
-        if (local) ServerSocket(0, 4, InetAddress.getByAddress(byteArrayOf(127, 0, 0, 1))) else ServerSocket(0, 4)
+    private val server = ServerSocket(0, 8)
 
-    /** The port the sender must connect to. */
+    /** The port the senders must connect to. */
     val port: Int get() = server.localPort
 
-    val framesReceived = AtomicLong()
-    val bytesReceived = AtomicLong()
-
-    /** True while a sender's connection is being read. */
-    val connected: Boolean get() = synchronized(lock) { client != null }
-
-    /**
-     * Smoothed time from the encoder handing a frame to the sender until it was stored here, in ms.
-     * Only meaningful when both ends run on the same device (same clock).
-     */
-    @Volatile
-    var transitMs = 0.0
-        private set
+    /** What a sender must present to be accepted. */
+    val token: String = newToken()
 
     private val lock = Any()
-    private var client: Socket? = null
-
-    /** What a sender must present to be accepted. */
-    var token: String = newToken()
-        get() = synchronized(lock) { field }
-        private set
+    private val peers = LinkedHashMap<String, Peer>()
 
     /** Socket writes are not allowed on the main thread. */
-    private val control = Executors.newSingleThreadExecutor()
+    private val control = Executors.newSingleThreadScheduledExecutor().apply {
+        // Compares the clocks, see Peer.clockOffsetNs.
+        scheduleWithFixedDelay({
+            val ask = ByteBuffer.allocate(9).put(StreamProtocol.CTRL_TIME.toByte()).putLong(0)
+            for (s in sockets()) {
+                ask.putLong(1, System.nanoTime())
+                runCatching { s.getOutputStream().write(ask.array()) }
+            }
+        }, 300, CLOCK_INTERVAL_MS, TimeUnit.MILLISECONDS)
+    }
     private val thread = Thread(::run, "StreamReceiver").apply { start() }
 
-    /**
-     * Ends the current stream and returns a new token for the next sender. After this, frames of
-     * the earlier stream that are still on their way no longer reach [sink].
-     */
-    fun newStream(): String = synchronized(lock) {
-        runCatching { client?.close() }
-        client = null
-        token = newToken()
-        token
+    private fun sockets(): List<Socket> = synchronized(lock) { peers.values.mapNotNull { it.socket } }
+
+    /** Asks all camera phones for a key frame as soon as possible (after a buffer was cleared or unfrozen). */
+    fun requestKeyFrame() {
+        val all = sockets()
+        control.execute { all.forEach { s -> runCatching { s.getOutputStream().write(StreamProtocol.CTRL_KEY_FRAME) } } }
     }
 
-    /** Asks the sender for a key frame as soon as possible (after the buffer was cleared or unfrozen). */
-    fun requestKeyFrame() {
-        val s = synchronized(lock) { client } ?: return
-        control.execute { runCatching { s.getOutputStream().write(StreamProtocol.CTRL_KEY_FRAME) } }
+    /** Tells a camera phone which camera settings to use (JSON, see CameraRemote). False if it is not connected. */
+    fun sendConfig(peer: Peer, json: String): Boolean {
+        val s = synchronized(lock) { peer.socket } ?: return false
+        val text = json.toByteArray(Charsets.UTF_8)
+        val bytes = ByteBuffer.allocate(5 + text.size).put(StreamProtocol.CTRL_CONFIG.toByte()).putInt(text.size).put(text).array()
+        control.execute { runCatching { s.getOutputStream().write(bytes) } }
+        return true
     }
 
     private fun run() {
@@ -461,60 +564,99 @@ class StreamReceiver(
             } catch (_: IOException) {
                 break
             }
-            // One thread per connection, so a new connection is seen while an old one is still open.
+            // One thread per connection: several camera phones, and a new connection of one of
+            // them is seen while its old one is still open.
             Thread({
                 try {
                     serve(s)
                 } catch (e: IOException) {
                     if (!server.isClosed && !s.isClosed) Log.w(TAG, "stream receiver: ${e.message}")
                 } finally {
-                    synchronized(lock) { if (client === s) client = null }
                     runCatching { s.close() }
                 }
             }, "StreamReceiverConnection").start()
         }
     }
 
-    /** True while [s] is the connection in use (not replaced by a newer one, not ended by [newStream]). */
-    private fun isCurrent(s: Socket): Boolean = client === s
-
     private fun serve(s: Socket) {
         s.tcpNoDelay = true
         s.soTimeout = HELLO_TIMEOUT_MS
         val inp = DataInputStream(BufferedInputStream(s.getInputStream(), 1 shl 18))
-        if (inp.readInt() != StreamProtocol.MAGIC) throw IOException("not a ReFreePlay stream")
+        if (inp.readInt() != StreamProtocol.MAGIC) throw IOException("not a ReFreePlay stream (or another version of the app)")
         val presented = inp.readUTF()
-        synchronized(lock) {
+        val id = inp.readUTF().take(64)
+        val name = inp.readUTF().take(64)
+        val peer = synchronized(lock) {
             if (presented != token) throw IOException("connection with a wrong token refused")
-            runCatching { client?.close() }
-            client = s
+            val p = peers[id] ?: run {
+                if (peers.size >= MAX_PEERS) throw IOException("too many camera phones")
+                Peer(id, name).also { peers[id] = it }
+            }
+            runCatching { p.socket?.close() }
+            p.socket = s
+            p.sink = null
+            p.clockSamples.clear()
+            p.clockOffsetNs = UNKNOWN
+            p.clockRoundTripMs = -1.0
+            p.connected = true
+            p
         }
-        // The sender writes at least a ping every second.
-        s.soTimeout = READ_TIMEOUT_MS
-        transitMs = 0.0
+        try {
+            // The sender writes at least a ping every second.
+            s.soTimeout = READ_TIMEOUT_MS
+            read(s, inp, peer)
+        } finally {
+            synchronized(lock) {
+                if (peer.socket === s) {
+                    peer.socket = null
+                    peer.sink = null
+                    peer.connected = false
+                }
+            }
+        }
+    }
+
+    private fun read(s: Socket, inp: DataInputStream, peer: Peer) {
+        /** True while [s] is this camera phone's connection, not replaced by a newer one. */
+        fun current(): Boolean = synchronized(lock) { peer.socket === s }
         var meta: StreamMeta? = null
         var data = ByteArray(1 shl 16)
         while (true) {
             when (val type = inp.read()) {
                 -1 -> return
                 StreamProtocol.MSG_PING -> Unit
+                StreamProtocol.MSG_TIME -> {
+                    val t0 = inp.readLong()
+                    val t1 = inp.readLong()
+                    val t2 = System.nanoTime()
+                    synchronized(lock) {
+                        if (peer.socket === s) {
+                            // The sender's clock showed t1 when ours was halfway between t0 and t2.
+                            peer.clockSamples.addLast(longArrayOf(t2 - t0, t1 - (t0 + (t2 - t0) / 2)))
+                            if (peer.clockSamples.size > CLOCK_SAMPLES) peer.clockSamples.removeFirst()
+                            val best = peer.clockSamples.minBy { it[0] }
+                            peer.clockOffsetNs = best[1]
+                            peer.clockRoundTripMs = best[0] / 1e6
+                        }
+                    }
+                }
+
                 StreamProtocol.MSG_META -> {
                     val m = StreamProtocol.readMeta(inp)
                     meta = m
-                    if (synchronized(lock) { isCurrent(s) }) listener?.onStreamMeta(m)
+                    if (current()) listener.onStreamMeta(peer, m)
+                }
+
+                StreamProtocol.MSG_CAPS -> {
+                    val json = StreamProtocol.readText(inp)
+                    if (current()) listener.onCapabilities(peer, json)
                 }
 
                 StreamProtocol.MSG_FORMAT -> {
                     val f = StreamProtocol.readFormat(inp)
-                    if (listener != null) {
-                        if (!synchronized(lock) { isCurrent(s) }) return
-                        listener.onStreamFormat(meta ?: throw IOException("format before stream info"), f)
-                    } else {
-                        synchronized(lock) {
-                            if (!isCurrent(s)) return
-                            sink.setFormat(f)
-                        }
-                    }
+                    if (!current()) return
+                    val sink = listener.onStreamFormat(peer, meta ?: throw IOException("format before stream info"), f)
+                    synchronized(lock) { if (peer.socket === s) peer.sink = sink }
                 }
 
                 StreamProtocol.MSG_FRAME -> {
@@ -525,14 +667,16 @@ class StreamReceiver(
                     if (size <= 0 || size > StreamProtocol.MAX_FRAME) throw IOException("bad frame size $size")
                     if (data.size < size) data = ByteArray(size + (size shr 2))
                     inp.readFully(data, 0, size)
+                    // When the frame left the camera phone's encoder, on this phone's clock.
+                    val offset = peer.clockOffsetNs
+                    val now = System.nanoTime()
+                    val encodedNs = (sentNs - offset).takeIf { offset != UNKNOWN && it <= now && it > now - MAX_AGE_NS } ?: 0L
                     synchronized(lock) {
-                        if (!isCurrent(s)) return
-                        sink.add(ByteBuffer.wrap(data, 0, size), size, ptsUs, key)
+                        if (peer.socket !== s) return
+                        peer.sink?.add(ByteBuffer.wrap(data, 0, size), size, ptsUs, key, encodedNs)
                     }
-                    framesReceived.incrementAndGet()
-                    bytesReceived.addAndGet(size.toLong())
-                    val t = (System.nanoTime() - sentNs) / 1e6
-                    transitMs = if (transitMs == 0.0) t else transitMs * 0.9 + t * 0.1
+                    peer.framesReceived.incrementAndGet()
+                    peer.bytesReceived.addAndGet(size.toLong())
                 }
 
                 else -> throw IOException("unknown message $type")
@@ -543,8 +687,12 @@ class StreamReceiver(
     fun close() {
         runCatching { server.close() }
         synchronized(lock) {
-            runCatching { client?.close() }
-            client = null
+            for (p in peers.values) {
+                runCatching { p.socket?.close() }
+                p.socket = null
+                p.sink = null
+                p.connected = false
+            }
         }
         control.shutdown()
         thread.join(1000)
@@ -553,14 +701,22 @@ class StreamReceiver(
     companion object {
         private const val TAG = "ReFreePlay"
 
-        /** The address a [local] receiver listens on. */
-        const val HOST = "127.0.0.1"
+        /** For a sender on the same phone (testing). */
+        const val LOCALHOST = "127.0.0.1"
 
-        /** A connection that doesn't introduce itself in this time is dropped, so it can't block the real one. */
+        /** A connection that doesn't introduce itself in this time is dropped. */
         private const val HELLO_TIMEOUT_MS = 3000
 
         /** A connection that stays silent this long is dead (Wi-Fi gone without a goodbye). */
         private const val READ_TIMEOUT_MS = 4000
+
+        private const val MAX_PEERS = 8
+        private const val UNKNOWN = Long.MIN_VALUE
+        private const val CLOCK_INTERVAL_MS = 1000L
+        private const val CLOCK_SAMPLES = 20
+
+        /** A frame that claims to be older than this was timed with a wrong clock offset. */
+        private const val MAX_AGE_NS = 5_000_000_000L
 
         private fun newToken(): String {
             val bytes = ByteArray(8)

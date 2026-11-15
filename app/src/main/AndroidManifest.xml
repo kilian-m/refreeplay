@@ -5,7 +5,7 @@
     <uses-permission android:name="android.permission.CAMERA" />
     <!-- Network sockets (also local ones), for streaming the video between two devices. -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <!-- Two-phone setup: the referee phone opens a local hotspot, the camera phone joins it. -->
+    <!-- Camera phones: the main phone opens a local hotspot, a camera phone joins it. -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />

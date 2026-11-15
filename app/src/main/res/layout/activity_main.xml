@@ -63,17 +63,19 @@
                 android:text="⚙"
                 android:textSize="20sp" />
 
-            <!-- Two-phone modes: shows the QR code (referee phone) or scans it (camera phone). -->
+            <!-- Main phone with camera phones: names the camera on screen; tap to see the next. -->
             <com.google.android.material.button.MaterialButton
-                android:id="@+id/btnPair"
+                android:id="@+id/btnFeed"
                 style="@style/Widget.Material3.Button.TonalButton"
                 android:layout_width="wrap_content"
                 android:layout_height="48dp"
                 android:layout_marginStart="8dp"
                 android:insetTop="0dp"
                 android:insetBottom="0dp"
-                android:text="Pair"
-                android:textSize="16sp"
+                android:maxLines="1"
+                android:paddingStart="14dp"
+                android:paddingEnd="14dp"
+                android:textSize="15sp"
                 android:visibility="gone" />
 
         </LinearLayout>
@@ -156,6 +158,21 @@
         android:textColor="#FFFFFF"
         android:textSize="16sp"
         android:textStyle="bold"
+        android:visibility="gone" />
+
+    <!-- Replay with several cameras: names the one playing; tap to see the next at the same moment. -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnReplayFeed"
+        style="@style/Widget.Material3.Button.TonalButton"
+        android:layout_width="wrap_content"
+        android:layout_height="48dp"
+        android:layout_gravity="top|start"
+        android:layout_marginStart="10dp"
+        android:layout_marginTop="56dp"
+        android:insetTop="0dp"
+        android:insetBottom="0dp"
+        android:maxLines="1"
+        android:textSize="15sp"
         android:visibility="gone" />
 
     <!-- Replay screen: timeline + transport controls -->
@@ -385,7 +402,7 @@
         </LinearLayout>
     </LinearLayout>
 
-    <!-- Referee phone: the QR code the camera phone scans to connect -->
+    <!-- Main phone: the QR code a camera phone scans to connect; tap to close -->
     <LinearLayout
         android:id="@+id/pairPanel"
         android:layout_width="wrap_content"

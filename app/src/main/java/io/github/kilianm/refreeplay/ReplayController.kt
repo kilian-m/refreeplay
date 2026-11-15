@@ -69,7 +69,8 @@ class ReplayController(context: Context, playerView: PlayerView, private val lis
 
     val frameCount: Int get() = framePts.size
 
-    fun load(mp4: VirtualMp4, speed: Float) {
+    /** Opens [mp4] at [startMs], playing or paused (showing the frame there). */
+    fun load(mp4: VirtualMp4, speed: Float, startMs: Long = 0, play: Boolean = true) {
         val ptsUs = mp4.index.ptsUs
         framePts = ptsUs
         durationMs = ceil(ptsUs.last() / 1000.0).toLong()
@@ -83,10 +84,10 @@ class ReplayController(context: Context, playerView: PlayerView, private val lis
             ExtractorsFactory { arrayOf(Mp4Extractor()) },
         )
             .createMediaSource(MediaItem.fromUri(Uri.parse("refreeplay://replay/${++loadCounter}")))
-        player.setMediaSource(source)
+        player.setMediaSource(source, startMs.coerceIn(0, durationMs))
         player.setPlaybackSpeed(speed)
         player.prepare()
-        player.playWhenReady = true
+        player.playWhenReady = play
     }
 
     private var loadCounter = 0

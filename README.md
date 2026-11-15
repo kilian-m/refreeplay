@@ -75,30 +75,39 @@ Rotating doesn't interrupt recording. Replays are shown upright according to how
 held when the button was pressed. In landscape, REPLAY and Quick save sit at the bottom left, so they
 stay reachable on a half-folded foldable phone standing like a camera stand.
 
-### Two phones: a camera phone and a referee phone
-The camera can stand where the view is best while the referee holds a second phone. The camera
-phone sends its video over Wi-Fi; the referee phone keeps it in memory and offers the replay,
-cutting and saving as usual. No router or internet is needed: the referee phone opens its own
-hotspot.
+### More cameras: camera phones
+A phone normally works on its own: it is the **main phone**, with its camera and the replays.
+Other phones can be added as more cameras. Such a **camera phone** only sends its picture over
+Wi-Fi; the main phone keeps it in memory next to its own and offers the replay, cutting and saving
+as usual. No router or internet is needed: the main phone opens its own hotspot.
 
-1. **Referee phone:** ⚙ → *This phone is* → **Referee phone**. Android asks once for the
-   permission it requires for opening a hotspot (*Nearby devices*; *Location* up to Android 12).
-   The phone then shows a QR code.
-2. **Camera phone:** ⚙ → *This phone is* → **Camera for a referee phone**. Tap **Pair** and point
-   the camera at the QR code. Android asks whether to connect to the referee phone's hotspot:
-   confirm.
-3. The referee phone shows the camera phone's picture; **REPLAY** and **Quick save** work as on
-   one phone.
+1. **Main phone:** ⚙ → **Add a camera phone**. Android asks once for the permission it requires
+   for opening a hotspot (*Nearby devices*; *Location* up to Android 12). The phone then shows a
+   QR code.
+2. **The other phone:** ⚙ → *This phone is* → **Camera phone**. It looks for the QR code with its
+   camera right away: point it at the main phone. Android asks whether to connect to the main
+   phone's hotspot: confirm.
+3. The main phone shows the new camera's picture. The button at the top names the camera on
+   screen ("⇄ This phone", "⇄ Camera 1"); tap it to see the next one.
 
-- Camera, resolution, frame rate and quality are set on the camera phone; replay length and
-  display delay on the referee phone.
+- **REPLAY** takes a clip of every camera. The same button on the replay screen switches to the
+  next camera at the same moment, playing or paused. Cutting and saving apply to the camera on
+  screen. The phones compare their clocks once a second, so the cameras line up to about a frame.
+- **Everything is set on the main phone.** Replay length and display delay apply to all cameras.
+  ⚙ lists the camera phones; **Camera settings** next to one chooses its camera, resolution,
+  frame rate and quality. A camera phone's own ⚙ only lets it become a main phone again.
+- All cameras share the memory (see *Settings* below): with one camera phone the longest possible
+  replay is half as long.
 - If the connection drops, the camera phone connects again on its own and the video already
   received stays; the part in between is missing. If the hotspot itself is gone (for example the
-  referee app was closed), tap **Pair** on both phones and scan the new code.
+  main phone's app was closed), the camera phone looks for a QR code again: show a new one with
+  **Add a camera phone**.
 - The camera phone's status line shows "⚠ connection too slow" when Wi-Fi can't keep up. Move the
-  phones closer or choose a lower quality or frame rate on the camera phone.
+  phones closer or choose a lower quality or frame rate for it.
+- **More than one camera phone can be added, but this is not tested** and may overload the main
+  phone, which receives all pictures and records itself; it says so when the second one connects.
 - The hotspot's name and password are new every time; they travel in the QR code together with a
-  one-time key, without which the referee phone accepts no connection. The video itself is only
+  one-time key, without which the main phone accepts no connection. The video itself is only
   protected by the hotspot's Wi-Fi encryption.
 
 ### Settings
@@ -112,8 +121,7 @@ Changes are applied when you close the settings dialog.
 | Quality | Bitrate: Standard / High / Maximum. |
 | Replay length | 1 to 600 s: how much video is kept in memory. |
 | Display delay | 0 (live) up to the replay length. |
-| This phone is | **One phone** (camera and replay, the default), **Camera for a referee phone** or **Referee phone**; see *Two phones* above. A camera phone has no replay length or delay, a referee phone no camera settings. |
-| Test: loopback | Off by default, one phone only. Sends the video through a local network connection into the buffer, as between two phones, and decodes the live picture from what was received. The status line shows the bitrate and the transit time. |
+| This phone is | **Main phone** (the default) or **Camera phone**; see *More cameras* above. Camera, resolution, frame rate, quality, replay length and delay are only shown on a main phone. |
 
 The buffer always holds exactly the replay length (plus up to half a second, because it's
 trimmed at key frames). The dialog shows how much memory the settings need and how much this
@@ -152,8 +160,9 @@ Camera2 ──┬──> SurfaceView (live preview)
 | `CameraCatalog.kt` | Lists cameras/lenses, resolutions and frame rates; picks defaults |
 | `CameraController.kt` | Camera2 session, zoom |
 | `VideoEncoder.kt` | Surface-input H.264 encoder that feeds the buffer |
-| `StreamLink.kt` | Two phones (and the loopback test): sends the encoder's output over a TCP connection into the buffer on the other end (sender, receiver, wire format, reconnecting) |
-| `Pairing.kt` | Two phones: the referee phone's hotspot, joining it from the camera phone, and the QR code that carries the connection data |
+| `StreamLink.kt` | Camera phones: sends the encoder's output over a TCP connection into a buffer on the main phone (sender, receiver for several camera phones, wire format, clock comparison, reconnecting) |
+| `Pairing.kt` | Camera phones: the main phone's hotspot, joining it from a camera phone, and the QR code that carries the connection data |
+| `CameraRemote.kt` | Camera phones: what their cameras can do and which settings the main phone chose for them, as JSON |
 | `FrameRingBuffer.kt` | Ring buffer in shared memory segments (freeze, pins for replays and saving), MP4 writer |
 | `VirtualMp4.kt` | Serves a replay to ExoPlayer as an MP4 that is never written: opens instantly at any length |
 | `DelayedViewer.kt` | Decodes the buffer with a fixed delay for the display delay |
