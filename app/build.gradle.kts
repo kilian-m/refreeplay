@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.kilianm.refreeplay"
         minSdk = 29
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.4"
+        versionCode = 5
+        versionName = "0.5"
     }
 
     buildTypes {
