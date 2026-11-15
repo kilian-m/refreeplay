@@ -207,6 +207,15 @@ class FrameRingBuffer : FrameSink {
         if (!value) awaitKey = true
     }
 
+    /**
+     * The video was interrupted (the stream reconnected): storing resumes at the next key frame,
+     * with timestamps shifted so that it continues right after the last stored frame.
+     */
+    @Synchronized
+    fun continueAfterGap() {
+        if (frames.isNotEmpty()) awaitKey = true
+    }
+
     /** Stores one encoded frame; [src] is positioned at the frame data. */
     @Synchronized
     override fun add(src: ByteBuffer, size: Int, rawPtsUs: Long, isKey: Boolean) {

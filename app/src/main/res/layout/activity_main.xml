@@ -63,6 +63,19 @@
                 android:text="⚙"
                 android:textSize="20sp" />
 
+            <!-- Two-phone modes: shows the QR code (referee phone) or scans it (camera phone). -->
+            <com.google.android.material.button.MaterialButton
+                android:id="@+id/btnPair"
+                style="@style/Widget.Material3.Button.TonalButton"
+                android:layout_width="wrap_content"
+                android:layout_height="48dp"
+                android:layout_marginStart="8dp"
+                android:insetTop="0dp"
+                android:insetBottom="0dp"
+                android:text="Pair"
+                android:textSize="16sp"
+                android:visibility="gone" />
+
         </LinearLayout>
 
         <TextView
@@ -370,6 +383,35 @@
                 android:text="Save as…" />
 
         </LinearLayout>
+    </LinearLayout>
+
+    <!-- Referee phone: the QR code the camera phone scans to connect -->
+    <LinearLayout
+        android:id="@+id/pairPanel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:background="#F0000000"
+        android:gravity="center"
+        android:orientation="vertical"
+        android:padding="14dp"
+        android:visibility="gone">
+
+        <ImageView
+            android:id="@+id/qrImage"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:contentDescription="QR code for the camera phone" />
+
+        <TextView
+            android:id="@+id/pairText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="10dp"
+            android:gravity="center"
+            android:maxWidth="360dp"
+            android:textColor="#FFFFFF"
+            android:textSize="15sp" />
     </LinearLayout>
 
     <TextView

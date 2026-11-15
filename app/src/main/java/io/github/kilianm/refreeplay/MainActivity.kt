@@ -6,15 +6,18 @@ import android.content.ContentValues
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.res.Configuration
+import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.hardware.display.DisplayManager
+import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.os.SystemClock
 import android.provider.MediaStore
@@ -26,6 +29,7 @@ import android.view.GestureDetector
 import android.view.Gravity
 import android.view.KeyEvent
 import android.view.MotionEvent
+import android.view.PixelCopy
 import android.view.ScaleGestureDetector
 import android.view.Surface
 import android.view.SurfaceHolder
@@ -38,6 +42,7 @@ import android.widget.ArrayAdapter
 import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.SeekBar
 import android.widget.Spinner
@@ -56,10 +61,15 @@ import com.google.android.material.button.MaterialButton
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.google.android.material.slider.RangeSlider
 import java.io.File
+import java.io.IOException
+import java.net.InetSocketAddress
+import java.net.Socket
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.max
@@ -67,7 +77,7 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraController.Listener,
-    ReplayController.Listener {
+    ReplayController.Listener, StreamReceiver.Listener {
 
     companion object {
         const val TAG = "ReFreePlay"
@@ -124,12 +134,47 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     private var config: CaptureConfig? = null
     private var encoder: VideoEncoder? = null
 
-    // Loopback test (see Prefs.loopback): the encoder's output goes through [sender] and a local
-    // connection to [receiver], which fills the buffer, as it would between two phones.
+    // Video stream. Camera phone: the encoder's output goes through [sender] to the referee phone.
+    // Referee phone: [receiver] fills the buffer with what the camera phone sends. Loopback test
+    // (see Prefs.loopback): both on this phone, over a local connection.
     private var sender: StreamSender? = null
     private var receiver: StreamReceiver? = null
     private var lastLinkBytes = 0L
     private var linkMbit = 0.0
+
+    // Referee phone
+    /** The video being received, as announced by the camera phone. */
+    private var remoteMeta: StreamMeta? = null
+    private var hotspot: HotspotHost? = null
+    private var hotspotCredentials: HotspotHost.Credentials? = null
+    private var hotspotStarting = false
+    private var hotspotError: String? = null
+    private var wifiPermissionAsked = false
+    private var everConnected = false
+
+    /** QR panel: shown or hidden with the Pair button; null = shown until the camera phone has connected. */
+    private var pairPanelWanted: Boolean? = null
+    private var shownQrText: String? = null
+    private var logPairing = false
+
+    // Camera phone ([hotspotClient] and [pairing] are read by the sender's thread when it connects)
+    @Volatile
+    private var hotspotClient: HotspotClient? = null
+
+    @Volatile
+    private var pairing: PairingInfo? = null
+    private var joinState: HotspotClient.State? = null
+    private var rejoinTried = false
+    private var scanning = false
+    private var scanThread: HandlerThread? = null
+    private var scanBitmap: Bitmap? = null
+    private var lastOverflows = 0L
+    private var lastOverflowTime = 0L
+
+    private lateinit var btnPair: MaterialButton
+    private lateinit var pairPanel: View
+    private lateinit var qrImage: ImageView
+    private lateinit var pairText: TextView
     private var wantRunning = false
     private var cameraActive = false
     private var keepBufferWhilePaused = false
@@ -186,6 +231,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             else showMessage("Camera permission is required.\nGrant it in Android Settings → Apps → ReFreePlay.")
         }
 
+    /** Referee phone: Android's permission for opening the hotspot. */
+    private val wifiPermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) startHotspot()
+            else showMessage("Without this permission the phone can't open the hotspot for the camera phone.\nGrant it in Android Settings → Apps → ReFreePlay → Permissions.")
+        }
+
     /** Opens the system "Save as" dialog; the user picks folder (or cloud drive) and file name. */
     private val saveAsLauncher =
         registerForActivityResult(ActivityResultContracts.CreateDocument("video/mp4")) { uri ->
@@ -215,6 +267,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             // Also catches 180° turns, which do not trigger a configuration change.
             updateDelayTransform()
             applyPreviewAspect()
+            // The other end must know how the camera is held now.
+            if (!isReferee) localVideoInfo()?.let { sender?.setMeta(it) }
         }
     }
 
@@ -254,6 +308,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         trimPanel = findViewById(R.id.trimPanel)
         trimSlider = findViewById(R.id.trimSlider)
         trimLabel = findViewById(R.id.trimLabel)
+        btnPair = findViewById(R.id.btnPair)
+        pairPanel = findViewById(R.id.pairPanel)
+        qrImage = findViewById(R.id.qrImage)
+        pairText = findViewById(R.id.pairText)
+        btnPair.setOnClickListener { onPairButton() }
 
         previewView.holder.addCallback(this)
         replay = ReplayController(this, playerView, this)
@@ -307,6 +366,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         if (ex.containsKey("replay")) prefs.replaySeconds = ex.getFloat("replay")
         if (ex.containsKey("delay")) prefs.delaySeconds = ex.getFloat("delay")
         if (ex.containsKey("loopback")) prefs.loopback = ex.getBoolean("loopback") // --ez loopback true
+        if (ex.containsKey("mode")) prefs.mode = ex.getInt("mode") // --ei mode 0 (one phone), 1 (camera), 2 (referee)
+        // Testing only (not stored): referee phone writes the QR code's text to the log;
+        // camera phone pairs with that text without scanning.
+        if (ex.containsKey("logPairing")) logPairing = ex.getBoolean("logPairing")
+        ex.getString("pair")?.let { text -> ui.post { if (isCameraOnly) onQrText(text) } }
         // Testing only (not stored): scales the memory estimate, e.g. 0.5 to check that the buffer grows.
         if (ex.containsKey("estimateScale")) estimateScale = ex.getFloat("estimateScale")
     }
@@ -331,14 +395,366 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         hideSystemBars()
         ui.post(ticker)
         applyOrientationLayout()
+        startForMode()
+    }
+
+    // ---------------------------------------------------------------- roles (one phone / camera / referee)
+
+    /** The role that is set up now; follows Prefs.mode in [startForMode]. */
+    private var activeMode = -1
+    private val isReferee: Boolean get() = activeMode == Prefs.MODE_REFEREE
+    private val isCameraOnly: Boolean get() = activeMode == Prefs.MODE_CAMERA
+
+    /** A display delay only exists where the video is watched. */
+    private fun displayDelay(): Float = if (isCameraOnly) 0f else prefs.delaySeconds
+
+    /** This phone's camera video as the other end needs to know it; null while no camera is set up. */
+    private fun localVideoInfo(): StreamMeta? = config?.let {
+        StreamMeta(it.width, it.height, it.fps, it.targetBitrate, it.rotationFor(displayRotationDegrees()), it.front)
+    }
+
+    /** The video in the buffer: from this phone's camera, or as announced by the camera phone. */
+    private fun videoInfo(): StreamMeta? = if (isReferee) remoteMeta else localVideoInfo()
+
+    /** Starts what this phone's role needs, after ending what an earlier role left running. */
+    private fun startForMode() {
+        if (activeMode != prefs.mode) {
+            leaveMode(activeMode)
+            activeMode = prefs.mode
+        }
         applyLiveUi()
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+        if (isReferee) {
+            keepBufferWhilePaused = false
+            startReferee()
+        } else if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             startPipeline()
             keepBufferWhilePaused = false
         } else if (!permissionAsked) {
             permissionAsked = true
             permissionLauncher.launch(Manifest.permission.CAMERA)
         }
+    }
+
+    private fun leaveMode(old: Int) {
+        if (inReplay) exitReplay()
+        stopPipeline()
+        closeReceiver()
+        when (old) {
+            Prefs.MODE_REFEREE -> {
+                hotspot?.stop()
+                hotspot = null
+                hotspotCredentials = null
+                hotspotStarting = false
+                hotspotError = null
+                remoteMeta = null
+                everConnected = false
+                pairPanelWanted = null
+                shownQrText = null
+                buffer.release()
+            }
+
+            Prefs.MODE_CAMERA -> {
+                stopScan()
+                hotspotClient?.leave()
+                hotspotClient = null
+                pairing = null
+                joinState = null
+            }
+        }
+        config = null
+        showingDelayWait = false
+        messageText.visibility = View.GONE
+        pairPanel.visibility = View.GONE
+    }
+
+    private fun closeReceiver() {
+        receiver?.close()
+        receiver = null
+        lastLinkBytes = 0
+        linkMbit = 0.0
+    }
+
+    // ---------------------------------------------------------------- referee phone
+
+    private fun startReferee() {
+        if (receiver?.local != false) {
+            closeReceiver()
+            receiver = try {
+                StreamReceiver(buffer, local = false, listener = this)
+            } catch (e: Exception) {
+                showMessage("Cannot wait for the camera phone's connection (${e.message}).")
+                return
+            }
+        }
+        startHotspot()
+        updatePairPanel()
+        maybeStartViewer()
+    }
+
+    /** Opens the hotspot the camera phone joins; asks for Android's permission first if needed. */
+    private fun startHotspot(retry: Boolean = true) {
+        if (!isReferee || hotspotCredentials != null || hotspotStarting) return
+        val permission =
+            if (Build.VERSION.SDK_INT >= 33) Manifest.permission.NEARBY_WIFI_DEVICES else Manifest.permission.ACCESS_FINE_LOCATION
+        if (ContextCompat.checkSelfPermission(this, permission) != PackageManager.PERMISSION_GRANTED) {
+            if (!wifiPermissionAsked) {
+                wifiPermissionAsked = true
+                wifiPermissionLauncher.launch(permission)
+            }
+            return
+        }
+        hotspotStarting = true
+        hotspotError = null
+        val host = hotspot ?: HotspotHost(this).also { hotspot = it }
+        host.start(
+            started = { c ->
+                hotspotStarting = false
+                hotspotCredentials = c
+                Log.i(TAG, "hotspot started: ${c.ssid} (${c.security})")
+                if (messageText.visibility == View.VISIBLE && !showingDelayWait) messageText.visibility = View.GONE
+                updatePairPanel()
+                // The hotspot's address can appear a moment later; it is part of the code.
+                ui.postDelayed({ updatePairPanel() }, 1500)
+            },
+            failed = { msg ->
+                hotspotCredentials = null
+                Log.w(TAG, "hotspot: $msg")
+                if (retry && isReferee) {
+                    // Try once more: when the app's screen was just rebuilt, Android may still be
+                    // closing the hotspot of the old one and refuses a second request.
+                    ui.postDelayed({
+                        hotspotStarting = false
+                        if (!isDestroyed) startHotspot(retry = false)
+                    }, 1500)
+                } else {
+                    hotspotStarting = false
+                    hotspotError = msg
+                    updatePairPanel()
+                    if (isReferee && !inReplay) showMessage("$msg\nTap Pair to try again.")
+                }
+            },
+        )
+    }
+
+    /** Shows the QR code for the camera phone, or hides it. */
+    private fun updatePairPanel() {
+        val c = hotspotCredentials
+        val r = receiver
+        if (!isReferee || inReplay || c == null || r == null || r.local || !(pairPanelWanted ?: !everConnected)) {
+            pairPanel.visibility = View.GONE
+            return
+        }
+        val text = PairingInfo(c.ssid, c.passphrase, c.security, HotspotHost.localAddresses(), r.port, r.token).toText()
+        if (text != shownQrText) {
+            val dm = resources.displayMetrics
+            qrImage.setImageBitmap(QrCodes.encode(text, (min(dm.widthPixels, dm.heightPixels) * 0.55f).toInt()))
+            shownQrText = text
+            if (logPairing) Log.i(TAG, "pairing: $text")
+        }
+        pairText.text = "On the camera phone: open ReFreePlay, set ⚙ \"This phone is\" to \"Camera for a referee phone\", " +
+            "tap Pair and point the camera at this code.\nHotspot: ${c.ssid}"
+        pairPanel.visibility = View.VISIBLE
+    }
+
+    private fun onPairButton() {
+        if (isReferee) {
+            if (hotspotCredentials == null) {
+                if (!hotspotStarting) {
+                    wifiPermissionAsked = false
+                    messageText.visibility = View.GONE
+                    startHotspot()
+                }
+                return
+            }
+            pairPanelWanted = pairPanel.visibility != View.VISIBLE
+            updatePairPanel()
+        } else if (isCameraOnly) {
+            if (scanning) stopScan() else startScan()
+        }
+    }
+
+    /** Receiver thread: waits until the main thread has prepared the buffer for the stream. */
+    override fun onStreamFormat(meta: StreamMeta, format: MediaFormat) {
+        val done = CountDownLatch(1)
+        ui.post {
+            try {
+                if (!isDestroyed && isReferee) prepareForStream(meta, format)
+            } finally {
+                done.countDown()
+            }
+        }
+        done.await(5, TimeUnit.SECONDS)
+    }
+
+    override fun onStreamMeta(meta: StreamMeta) {
+        ui.post {
+            // Only how the camera is held may change here; a different video is set up in prepareForStream.
+            if (isReferee && remoteMeta?.sameVideo(meta) == true) {
+                remoteMeta = meta
+                updateDelayTransform()
+            }
+        }
+    }
+
+    /**
+     * The camera phone (re)connected. If it sends the same video as before, the buffered video is
+     * kept and continues; otherwise the buffer is set up for the new video.
+     */
+    private fun prepareForStream(meta: StreamMeta, format: MediaFormat) {
+        val same = remoteMeta?.sameVideo(meta) == true && buffer.capacityBytes > 0 &&
+            StreamProtocol.sameCodecConfig(buffer.currentFormat(), format)
+        Log.i(TAG, "camera phone connected: ${meta.width}x${meta.height} ${meta.fps} fps, " +
+            "${meta.bitrate / 1000} kbit/s, rotation ${meta.rotation}" + if (same) " (continues)" else "")
+        remoteMeta = meta
+        everConnected = true
+        pairPanelWanted = null
+        updatePairPanel()
+        if (same) {
+            buffer.continueAfterGap()
+            updateDelayTransform()
+            return
+        }
+        if (inReplay) exitReplay()
+        stopViewer()
+        if (!configureBuffer(meta.bitrate, resetFormat = true)) return
+        buffer.setFormat(format)
+        messageText.visibility = View.GONE
+        applyLiveUi()
+        updateDelayTransform()
+        maybeStartViewer()
+    }
+
+    // ---------------------------------------------------------------- camera phone
+
+    private val scanTick = object : Runnable {
+        override fun run() {
+            if (!scanning) return
+            val tick = this
+            val thread = scanThread
+            val w = previewView.width
+            val h = previewView.height
+            if (thread == null || !cameraActive || w <= 0 || h <= 0 || !previewView.holder.surface.isValid) {
+                ui.postDelayed(tick, 300)
+                return
+            }
+            // A copy of the preview picture, at most 1920 pixels wide or high: the code is still
+            // readable when it is small in the picture.
+            val scale = min(1f, 1920f / max(w, h))
+            val bw = (w * scale).toInt()
+            val bh = (h * scale).toInt()
+            val bmp = scanBitmap?.takeIf { it.width == bw && it.height == bh }
+                ?: Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888).also { scanBitmap = it }
+            try {
+                PixelCopy.request(previewView, bmp, { result ->
+                    val text = if (result == PixelCopy.SUCCESS) QrCodes.decode(bmp) else null
+                    ui.post {
+                        if (scanning && (text == null || !onQrText(text))) ui.postDelayed(tick, 150)
+                    }
+                }, Handler(thread.looper))
+            } catch (e: IllegalArgumentException) {
+                ui.postDelayed(tick, 300)
+            }
+        }
+    }
+
+    /** Looks for the referee phone's QR code in the camera picture. */
+    private fun startScan() {
+        if (scanning) return
+        scanning = true
+        btnPair.text = "Cancel"
+        showMessage("Point this camera at the QR code on the referee phone.")
+        if (scanThread == null) scanThread = HandlerThread("QrScan").apply { start() }
+        ui.post(scanTick)
+    }
+
+    private fun stopScan() {
+        if (!scanning) return
+        scanning = false
+        ui.removeCallbacks(scanTick)
+        btnPair.text = "Pair"
+        messageText.visibility = View.GONE
+    }
+
+    /** Handles a scanned code. Returns false if it is not a pairing code of this app. */
+    private fun onQrText(text: String): Boolean {
+        val info = PairingInfo.parse(text) ?: return false
+        stopScan()
+        pairing = info
+        rejoinTried = false
+        joinState = null
+        showMessage("Joining the referee phone's hotspot…\nConfirm the connection if Android asks.")
+        joinHotspot(info)
+        return true
+    }
+
+    private fun joinHotspot(info: PairingInfo) {
+        val client = hotspotClient ?: HotspotClient(this).also { hotspotClient = it }
+        try {
+            client.join(info) { state -> onJoinState(info, state) }
+        } catch (e: Exception) {
+            showMessage("Could not join the referee phone's hotspot: ${e.message}")
+        }
+    }
+
+    private fun onJoinState(info: PairingInfo, state: HotspotClient.State) {
+        if (pairing !== info || !isCameraOnly) return
+        Log.i(TAG, "hotspot ${info.ssid}: $state")
+        joinState = state
+        when (state) {
+            HotspotClient.State.JOINED -> {
+                rejoinTried = false
+                messageText.visibility = View.GONE
+            }
+
+            // Android does not rejoin on its own: ask once more, then leave it to the user.
+            HotspotClient.State.LOST -> if (!rejoinTried) {
+                rejoinTried = true
+                ui.postDelayed({
+                    if (pairing === info && joinState == HotspotClient.State.LOST && isCameraOnly) joinHotspot(info)
+                }, 2000)
+            }
+
+            // A toast: returning from Android's dialog restarts the camera, which clears messages.
+            // The status line keeps showing the state.
+            HotspotClient.State.UNAVAILABLE -> {
+                messageText.visibility = View.GONE
+                Toast.makeText(
+                    this, "Could not join the referee phone's hotspot. Check that it still shows its code, then tap Pair and scan it again.",
+                    Toast.LENGTH_LONG,
+                ).show()
+            }
+        }
+    }
+
+    /** Sender thread: opens the connection to the referee phone, over the hotspot's network. */
+    private fun connectToReferee(): StreamSender.Link {
+        val info = pairing ?: throw IOException("not paired yet")
+        val client = hotspotClient
+        val network = client?.network ?: throw IOException("the referee phone's hotspot is not joined")
+        var failure: IOException? = null
+        for (host in (listOfNotNull(client.gateway) + info.hosts).distinct()) {
+            val s = network.socketFactory.createSocket()
+            try {
+                s.connect(InetSocketAddress(host, info.port), 1500)
+                return StreamSender.Link(s, info.token)
+            } catch (e: IOException) {
+                runCatching { s.close() }
+                failure = e
+            }
+        }
+        throw failure ?: IOException("the referee phone's address is not known yet")
+    }
+
+    /** Sender thread, loopback test: opens the connection to the receiver on this phone. */
+    private fun connectLocal(port: Int, token: String): StreamSender.Link {
+        val s = Socket()
+        try {
+            s.connect(InetSocketAddress(StreamReceiver.HOST, port), 2000)
+        } catch (e: IOException) {
+            runCatching { s.close() }
+            throw e
+        }
+        return StreamSender.Link(s, token)
     }
 
     override fun onPause() {
@@ -363,8 +779,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         replay.release()
         camera.shutdown()
         releaseEncoder()
-        receiver?.close()
-        receiver = null
+        closeReceiver()
+        scanning = false
+        ui.removeCallbacks(scanTick)
+        scanThread?.quitSafely()
+        hotspotClient?.leave()
+        hotspot?.stop()
         buffer.release()
         io.shutdown()
     }
@@ -400,6 +820,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     }
 
     private fun startPipeline() {
+        if (isReferee) return // no camera of its own
         wantRunning = true
         val cfg = try {
             catalog.resolve(prefs)
@@ -427,22 +848,30 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             enc = null
         }
         if (enc == null) {
-            // Loopback test: end the previous stream first, so none of its frames reach the new buffer.
-            var streamId = 0
-            if (prefs.loopback) {
+            val meta = localVideoInfo() ?: return
+            val link: StreamSender?
+            if (isCameraOnly) {
+                // The referee phone keeps the video; this phone only sends it.
+                closeReceiver()
+                buffer.release()
+                link = StreamSender(meta, ::connectToReferee)
+            } else if (prefs.loopback) {
                 val r = receiver ?: try {
-                    StreamReceiver(buffer).also { receiver = it }
+                    StreamReceiver(buffer, local = true).also { receiver = it }
                 } catch (e: Exception) {
                     showMessage("Loopback test: cannot open a local connection (${e.message}).")
                     return
                 }
-                streamId = r.expectStream()
+                // End the previous stream first, so none of its frames reach the new buffer.
+                val token = r.newStream()
+                if (!configureBuffer(cfg.targetBitrate, resetFormat = true)) return
+                val port = r.port
+                link = StreamSender(meta) { connectLocal(port, token) }
             } else {
-                receiver?.close()
-                receiver = null
+                closeReceiver()
+                if (!configureBuffer(cfg.targetBitrate, resetFormat = true)) return
+                link = null
             }
-            if (!configureBuffer(cfg, resetFormat = true)) return
-            val link = receiver?.let { StreamSender(StreamReceiver.HOST, it.port, streamId) }
             enc = try {
                 lateinit var created: VideoEncoder
                 created = VideoEncoder(cfg, link ?: buffer) { msg -> ui.post { onEncoderError(created, msg) } }
@@ -468,11 +897,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         BufferSizing.bufferSeconds(prefs.replaySeconds, prefs.delaySeconds)
 
     /** Sizes the buffer. Discards the buffered video. */
-    private fun configureBuffer(cfg: CaptureConfig, resetFormat: Boolean): Boolean {
+    private fun configureBuffer(bitrate: Int, resetFormat: Boolean): Boolean {
         val seconds = activeBufferSeconds()
         // Reserve up to the safe maximum, but start with the estimated need; the buffer grows only if
         // the real bitrate is higher (unused memory is never touched, so it costs nothing).
-        val estimate = (BufferSizing.bytesFor(cfg.targetBitrate, seconds) * estimateScale).toLong()
+        val estimate = (BufferSizing.bytesFor(bitrate, seconds) * estimateScale).toLong()
         var capacity = BufferSizing.maxBytes(this)
         while (true) {
             try {
@@ -511,16 +940,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     }
 
     /**
-     * Asks the encoder for a key frame. In the loopback test the request travels back over the
-     * connection, as it would from the referee's phone.
+     * Asks the encoder for a key frame. On a referee phone (and in the loopback test) the request
+     * travels back over the connection to the camera's encoder.
      */
     private fun requestKeyFrame() {
         val r = receiver
         if (r != null) r.requestKeyFrame() else encoder?.requestKeyFrame()
     }
 
-    /** The live screen shows video decoded from the buffer: with a display delay, and in the loopback test. */
-    private fun liveFromBuffer(): Boolean = prefs.delaySeconds > 0f || prefs.loopback
+    /**
+     * The live screen shows video decoded from the buffer: on a referee phone, with a display
+     * delay, and in the loopback test. Otherwise it shows the camera preview directly.
+     */
+    private fun liveFromBuffer(): Boolean = isReferee || (!isCameraOnly && (prefs.delaySeconds > 0f || prefs.loopback))
 
     private fun stopPipeline() {
         wantRunning = false
@@ -672,12 +1104,17 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     /** Live screen: live preview, or the delayed picture when a display delay is set. */
     private fun applyLiveUi() {
-        val delayed = prefs.delaySeconds > 0f
+        val delayed = displayDelay() > 0f
         btnBig.text = "REPLAY"
         delayBadge.text = "⏱ DELAY ${fmtSeconds(prefs.delaySeconds)} s"
+        btnPair.visibility = if (isReferee || isCameraOnly) View.VISIBLE else View.GONE
         if (inReplay) return
+        // A camera phone has nothing to replay or save.
+        liveActions.visibility = if (isCameraOnly) View.GONE else View.VISIBLE
+        updatePairPanel()
         val decoded = liveFromBuffer()
-        delayView.visibility = if (decoded) View.VISIBLE else View.GONE
+        // A referee phone has no picture before the camera phone connects (the view would show an old one).
+        delayView.visibility = if (decoded && (!isReferee || remoteMeta != null)) View.VISIBLE else View.GONE
         delayBadge.visibility = if (delayed) View.VISIBLE else View.GONE
         setPreviewHidden(decoded)
         if (!delayed && showingDelayWait) {
@@ -719,8 +1156,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     private fun maybeStartViewer() {
         if (!liveFromBuffer() || inReplay || viewerRunning) return
         val surface = delaySurface ?: return
-        if (encoder == null || !cameraActive) return
-        viewer.start(surface, (prefs.delaySeconds * 1e9).toLong())
+        if (isReferee) {
+            if (remoteMeta == null) return
+        } else if (encoder == null || !cameraActive) {
+            return
+        }
+        viewer.start(surface, (displayDelay() * 1e9).toLong())
         viewerRunning = true
         updateDelayTransform()
     }
@@ -732,7 +1173,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     }
 
     private fun onDelayStatus(waitSeconds: Double?) {
-        if (prefs.delaySeconds <= 0f || inReplay) return
+        if (displayDelay() <= 0f || inReplay) return
         if (waitSeconds == null) {
             if (showingDelayWait) {
                 showingDelayWait = false
@@ -751,13 +1192,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     /** Rotates, mirrors (front camera) and fits the decoded video into the TextureView. */
     private fun updateDelayTransform() {
-        val cfg = config ?: return
+        val info = videoInfo() ?: return
         val vw = delayView.width.toFloat()
         val vh = delayView.height.toFloat()
         if (vw <= 0f || vh <= 0f) return
-        val bw = cfg.width.toFloat()
-        val bh = cfg.height.toFloat()
-        val rot = cfg.rotationFor(displayRotationDegrees())
+        val bw = info.width.toFloat()
+        val bh = info.height.toFloat()
+        val rot = info.rotation
         val cw = if (rot % 180 != 0) bh else bw
         val ch = if (rot % 180 != 0) bw else bh
         val s = min(vw / cw, vh / ch)
@@ -765,7 +1206,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         m.setScale(bw / vw, bh / vh) // undo the default stretch to the view size
         m.postTranslate(-bw / 2f, -bh / 2f)
         m.postRotate(rot.toFloat())
-        m.postScale(if (cfg.front) -s else s, s)
+        m.postScale(if (info.front) -s else s, s)
         m.postTranslate(vw / 2f, vh / 2f)
         delayView.setTransform(m)
     }
@@ -786,8 +1227,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         if (inReplay) exitReplay()
         stopViewer()
         if (activeBufferSeconds() != oldBuffer) {
-            val cfg = config
-            if (cfg != null && encoder != null) configureBuffer(cfg, resetFormat = false)
+            val bitrate = when {
+                isReferee -> remoteMeta?.bitrate
+                isCameraOnly || encoder == null -> null // no buffer in use
+                else -> config?.targetBitrate
+            }
+            if (bitrate != null) configureBuffer(bitrate, resetFormat = false)
         }
         applyLiveUi()
         maybeStartViewer()
@@ -796,57 +1241,104 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     // ---------------------------------------------------------------- status
 
     private fun updateStatus() {
-        val cfg = config
-        val enc = encoder
+        val info = videoInfo()
+        val r = receiver
+        val s = sender
+        // Frames that arrived on this phone's side of the video: from its encoder, or from the camera phone.
+        val frames = if (isReferee) r?.framesReceived?.get() else encoder?.framesEncoded
         val now = SystemClock.elapsedRealtime()
-        if (enc != null && now - lastFpsTime >= 1000) {
-            val frames = enc.framesEncoded
+        if (frames != null && now - lastFpsTime >= 1000) {
+            val linkBytes = r?.bytesReceived?.get() ?: s?.bytesSent?.get()
             if (lastFpsTime > 0) {
-                measuredFps = (frames - lastFrames) * 1000.0 / (now - lastFpsTime)
+                measuredFps = max(0L, frames - lastFrames) * 1000.0 / (now - lastFpsTime)
                 Log.d(TAG, "measured %.1f fps, buffer %.1f s, %d kB, using %d MB".format(
                     measuredFps, buffer.bufferedUs() / 1e6, buffer.bufferedBytes() / 1000, buffer.usableBytes shr 20))
-            }
-            receiver?.let { r ->
-                val received = r.bytesReceived.get()
-                if (lastFpsTime > 0) {
-                    linkMbit = max(0L, received - lastLinkBytes) * 8.0 / 1000.0 / (now - lastFpsTime)
-                    Log.d(TAG, "loopback: %.1f Mbit/s, transit %.1f ms, %d frames received, %d overflows".format(
-                        linkMbit, r.transitMs, r.framesReceived.get(), sender?.overflows?.get() ?: 0))
+                if (linkBytes != null) {
+                    linkMbit = max(0L, linkBytes - lastLinkBytes) * 8.0 / 1000.0 / (now - lastFpsTime)
+                    Log.d(TAG, "stream: %.1f Mbit/s".format(linkMbit) +
+                        (if (s != null) ", %d overflows".format(s.overflows.get()) else "") +
+                        (if (r?.local == true) ", transit %.1f ms".format(r.transitMs) else ""))
                 }
-                lastLinkBytes = received
             }
+            if (linkBytes != null) lastLinkBytes = linkBytes
+            val overflows = s?.overflows?.get() ?: 0
+            if (overflows > lastOverflows) lastOverflowTime = now
+            lastOverflows = overflows
             lastCaptured = camera.capturedFrames.get()
             lastFrames = frames
             lastFpsTime = now
         }
-        statusText.text = if (cfg == null || enc == null) {
-            "Camera stopped"
-        } else {
-            // Written for the user: how much video is ready, plus warnings only when something is off.
-            val have = buffer.bufferedUs() / 1e6f
-            val want = prefs.replaySeconds
-            val parts = ArrayList<String>()
-            // Once the buffer was full, stay "ready" (no flipping back to "Recording…"); if it holds
-            // a little less for a moment, show the real length instead.
-            if (have + 0.3f >= want) readyGeneration = buffer.generation
-            parts += when {
-                readyGeneration != buffer.generation ->
-                    "Recording… %d of %s s".format(have.toInt(), fmtSeconds(want))
-                have + 0.5f >= want -> "Replay ready: last ${fmtSeconds(want)} s"
-                else -> "Replay ready: last %d s".format(have.toInt())
-            }
-            if (buffer.limitedByMemory) parts += "⚠ memory full"
-            if (measuredFps > 0 && measuredFps < cfg.fps * 0.85) {
-                parts += "⚠ only %d of %d fps".format(measuredFps.roundToInt(), cfg.fps)
-            }
+
+        // Written for the user: what is ready, plus warnings only when something is off.
+        val parts = ArrayList<String>()
+        fun addFpsWarning(fps: Int) {
+            if (measuredFps > 0 && measuredFps < fps * 0.85) parts += "⚠ only %d of %d fps".format(measuredFps.roundToInt(), fps)
+        }
+        fun addZoom() {
             val zoom = camera.zoomRatio
             if (abs(zoom - 1f) > 0.01f) parts += "Zoom %.1f×".format(zoom)
-            receiver?.let { r ->
-                parts += if (r.connected) "⇄ loopback %.0f Mbit/s, %.0f ms".format(linkMbit, r.transitMs)
-                else "⇄ loopback: not connected"
-            }
-            "● " + parts.joinToString("  ·  ")
         }
+        statusText.text = when {
+            isReferee -> when {
+                r == null -> "Referee phone: not started"
+                info == null && hotspotCredentials == null ->
+                    if (hotspotStarting) "Referee phone: starting the hotspot…" else "Referee phone: no hotspot (tap Pair)"
+                info == null -> "Referee phone: waiting for the camera phone"
+                else -> {
+                    parts += bufferStatus()
+                    if (r.connected) {
+                        addFpsWarning(info.fps)
+                        parts += "⇄ %.0f Mbit/s".format(linkMbit)
+                    } else {
+                        parts += "⚠ camera phone not connected"
+                    }
+                    "● " + parts.joinToString("  ·  ")
+                }
+            }
+
+            info == null || encoder == null -> "Camera stopped"
+
+            isCameraOnly -> {
+                parts += when {
+                    s?.connected == true -> "Sending to the referee phone ⇄ %.0f Mbit/s".format(linkMbit)
+                    pairing == null -> "Camera phone: not paired (tap Pair)"
+                    joinState == HotspotClient.State.UNAVAILABLE -> "Camera phone: could not join the hotspot (tap Pair)"
+                    joinState == HotspotClient.State.LOST -> "Camera phone: hotspot lost, joining again…"
+                    joinState == null -> "Camera phone: joining the hotspot…"
+                    else -> "Camera phone: connecting…"
+                }
+                if (lastOverflowTime > 0 && now - lastOverflowTime < 5000) parts += "⚠ connection too slow"
+                addFpsWarning(info.fps)
+                addZoom()
+                "● " + parts.joinToString("  ·  ")
+            }
+
+            else -> {
+                parts += bufferStatus()
+                addFpsWarning(info.fps)
+                addZoom()
+                if (r != null) {
+                    parts += if (r.connected) "⇄ loopback %.0f Mbit/s, %.0f ms".format(linkMbit, r.transitMs)
+                    else "⇄ loopback: not connected"
+                }
+                "● " + parts.joinToString("  ·  ")
+            }
+        }
+    }
+
+    /** How much video is ready for a replay, and a warning if memory limits it. */
+    private fun bufferStatus(): String {
+        val have = buffer.bufferedUs() / 1e6f
+        val want = prefs.replaySeconds
+        // Once the buffer was full, stay "ready" (no flipping back to "Recording…"); if it holds
+        // a little less for a moment, show the real length instead.
+        if (have + 0.3f >= want) readyGeneration = buffer.generation
+        val ready = when {
+            readyGeneration != buffer.generation -> "Recording… %d of %s s".format(have.toInt(), fmtSeconds(want))
+            have + 0.5f >= want -> "Replay ready: last ${fmtSeconds(want)} s"
+            else -> "Replay ready: last %d s".format(have.toInt())
+        }
+        return if (buffer.limitedByMemory) "$ready  ·  ⚠ memory full" else ready
     }
 
     // ---------------------------------------------------------------- replay / review
@@ -858,9 +1350,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
      */
     private fun triggerReplay() {
         val seconds = prefs.replaySeconds
-        val review = prefs.delaySeconds > 0f
-        if (inReplay) return
-        val cfg = config ?: return
+        val review = displayDelay() > 0f
+        if (inReplay || isCameraOnly) return
+        val info = videoInfo() ?: return
         val pinned = buffer.snapshot((seconds * 1_000_000).toLong())
         if (pinned == null || pinned.frames.size < 2) {
             toast("Nothing recorded yet")
@@ -870,7 +1362,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         if (freeze) buffer.setFrozen(true)
         stopViewer()
         showingDelayWait = false
-        val rotation = cfg.rotationFor(displayRotationDegrees())
+        val rotation = info.rotation
         // The replay is played straight from the buffer (no file is written), so it opens at once.
         val t0 = SystemClock.elapsedRealtime()
         var snap: ReplaySnapshot = pinned
@@ -911,6 +1403,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         playerView.visibility = View.VISIBLE
         delayView.visibility = View.GONE
         delayBadge.visibility = View.GONE
+        pairPanel.visibility = View.GONE
         setPreviewHidden(true)
         liveActions.visibility = View.GONE
         topBar.visibility = View.GONE
@@ -1213,14 +1706,14 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
     /** Quick save of the whole buffer (live / delay screen): straight into Movies/ReFreePlay. */
     private fun quickSaveBuffer() {
         if (quickSaving) return
-        val cfg = config ?: return
+        val info = videoInfo() ?: return
         val snap = buffer.snapshot(buffer.durationUs)
         if (snap == null || snap.frames.size < 2) {
             toast("Nothing recorded yet")
             return
         }
         quickSaving = true
-        saveSnapshotToGallery(snap, cfg.rotationFor(displayRotationDegrees())) { quickSaving = false }
+        saveSnapshotToGallery(snap, info.rotation) { quickSaving = false }
         snap.release() // the save holds its own pin
     }
 
@@ -1388,6 +1881,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         val replayText: String,
         val delayText: String,
         val loopback: Boolean,
+        /** Prefs.MODE_… */
+        val mode: Int,
     )
 
     /**
@@ -1409,6 +1904,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         val etDelay = view.findViewById<EditText>(R.id.etDelay)
         val cbLoopback = view.findViewById<CheckBox>(R.id.cbLoopback)
         val infoText = view.findViewById<TextView>(R.id.infoText)
+        val spMode = view.findViewById<Spinner>(R.id.spMode)
+        val groupCamera = view.findViewById<View>(R.id.groupCamera)
+        val groupDurations = view.findViewById<View>(R.id.groupDurations)
 
         fun adapter(items: List<String>) =
             ArrayAdapter(this, android.R.layout.simple_spinner_item, items).apply {
@@ -1433,17 +1931,28 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
                 replayText = etReplay.text.toString(),
                 delayText = etDelay.text.toString(),
                 loopback = cbLoopback.isChecked,
+                mode = spMode.selectedItemPosition,
             )
         }
 
         fun updateInfo() {
+            val mode = spMode.selectedItemPosition
+            if (mode == Prefs.MODE_CAMERA) {
+                infoText.text = "The referee phone sets the replay length and keeps the video."
+                return
+            }
             val f = fpsList.getOrNull(spFps.selectedItemPosition)
-            if (sizes.getOrNull(spResolution.selectedItemPosition) == null || f == null) {
+            if (mode == Prefs.MODE_SINGLE && (sizes.getOrNull(spResolution.selectedItemPosition) == null || f == null)) {
                 infoText.text = "No supported frame rate for this resolution."
                 return
             }
             val d = draft()
-            val br = estimateBitrate(d.width, d.height, d.fps, d.quality)
+            // A referee phone learns the bitrate from the camera phone.
+            val br = if (mode == Prefs.MODE_REFEREE) remoteMeta?.bitrate else estimateBitrate(d.width, d.height, d.fps, d.quality)
+            if (br == null) {
+                infoText.text = "Camera, resolution and quality are set on the camera phone."
+                return
+            }
             val sb = StringBuilder()
             val replay = parseSeconds(d.replayText)
             val delay = parseSeconds(d.delayText)
@@ -1481,6 +1990,19 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         etReplay.setText(initial?.replayText ?: fmtSeconds(prefs.replaySeconds))
         etDelay.setText(initial?.delayText ?: fmtSeconds(prefs.delaySeconds))
         cbLoopback.isChecked = initial?.loopback ?: prefs.loopback
+        spMode.adapter = adapter(listOf("One phone: camera and replay", "Camera for a referee phone", "Referee phone: video from a camera phone"))
+        spMode.setSelection(initial?.mode ?: prefs.mode)
+        fun showGroups() {
+            val mode = spMode.selectedItemPosition
+            groupCamera.visibility = if (mode == Prefs.MODE_REFEREE) View.GONE else View.VISIBLE
+            groupDurations.visibility = if (mode == Prefs.MODE_CAMERA) View.GONE else View.VISIBLE
+            cbLoopback.visibility = if (mode == Prefs.MODE_SINGLE) View.VISIBLE else View.GONE
+        }
+        showGroups()
+        spMode.onItemSelectedListener = SimpleItemSelected {
+            showGroups()
+            updateInfo()
+        }
         spCamera.adapter = adapter(cams.map { it.label })
         val camKey = initial?.cameraKey ?: cur?.camera?.key ?: prefs.cameraKey
         spCamera.setSelection(cams.indexOfFirst { it.key == camKey }.coerceAtLeast(0))
@@ -1521,6 +2043,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     /** Why [d] can't be used, in one or two sentences; null if it is fine. */
     private fun settingsProblem(d: SettingsDraft): String? {
+        if (d.mode == Prefs.MODE_CAMERA) return null // a camera phone keeps no video
         val replay = parseSeconds(d.replayText)
         val delay = parseSeconds(d.delayText)
         val minS = BufferSizing.MIN_SECONDS
@@ -1535,7 +2058,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             return "The display delay (${fmtSeconds(delay)} s) can't be longer than the replay length " +
                 "(${fmtSeconds(replay)} s): the delayed picture comes from the replay memory."
         }
-        val br = estimateBitrate(d.width, d.height, d.fps, d.quality)
+        // A referee phone learns the bitrate from the camera phone; before that, memory can't be checked.
+        val br = if (d.mode == Prefs.MODE_REFEREE) remoteMeta?.bitrate ?: return null
+        else estimateBitrate(d.width, d.height, d.fps, d.quality)
         val seconds = BufferSizing.bufferSeconds(replay, delay)
         val need = BufferSizing.bytesFor(br, seconds)
         val max = BufferSizing.maxBytes(this)
@@ -1563,6 +2088,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
             replayText = fmtSeconds(prefs.replaySeconds),
             delayText = fmtSeconds(prefs.delaySeconds),
             loopback = prefs.loopback,
+            mode = prefs.mode,
         )
         val problem = settingsProblem(stored) ?: return
         MaterialAlertDialogBuilder(this)
@@ -1576,12 +2102,20 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     /** Applies the settings from the dialog, or explains why they can't be used. */
     private fun applySettings(d: SettingsDraft) {
-        val captureChanged = d.cameraKey != (config?.camera?.key ?: prefs.cameraKey) ||
-            d.width != prefs.width || d.height != prefs.height || d.fps != prefs.fps || d.quality != prefs.quality ||
-            d.loopback != prefs.loopback
-        if (!captureChanged && parseSeconds(d.replayText) == prefs.replaySeconds &&
-            parseSeconds(d.delayText) == prefs.delaySeconds
-        ) return // nothing changed
+        // Only what the chosen role shows in the dialog counts: a referee phone has no camera
+        // settings, a camera phone no replay length or delay.
+        val modeChanged = d.mode != prefs.mode
+        val usesCamera = d.mode != Prefs.MODE_REFEREE
+        val usesBuffer = d.mode != Prefs.MODE_CAMERA
+        val single = d.mode == Prefs.MODE_SINGLE
+        val captureChanged = usesCamera && (
+            d.cameraKey != (config?.camera?.key ?: prefs.cameraKey) ||
+                d.width != prefs.width || d.height != prefs.height || d.fps != prefs.fps || d.quality != prefs.quality ||
+                (single && d.loopback != prefs.loopback)
+            )
+        val durationsChanged = usesBuffer &&
+            (parseSeconds(d.replayText) != prefs.replaySeconds || parseSeconds(d.delayText) != prefs.delaySeconds)
+        if (!modeChanged && !captureChanged && !durationsChanged) return // nothing changed
         val problem = settingsProblem(d)
         if (problem != null) {
             MaterialAlertDialogBuilder(this)
@@ -1593,24 +2127,33 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
                 .show()
             return
         }
-        val replay = parseSeconds(d.replayText)!!
-        val delay = parseSeconds(d.delayText)!!
-        if (captureChanged) {
+        // settingsProblem has checked the durations where they are used.
+        val replay = if (usesBuffer) parseSeconds(d.replayText)!! else prefs.replaySeconds
+        val delay = if (usesBuffer) parseSeconds(d.delayText)!! else prefs.delaySeconds
+        if (!modeChanged && !captureChanged) {
+            applyDurations(replay, delay)
+            return
+        }
+        if (usesCamera) {
             prefs.cameraKey = d.cameraKey
             prefs.width = d.width
             prefs.height = d.height
             prefs.fps = d.fps
             prefs.quality = d.quality
-            prefs.loopback = d.loopback
-            // Restarting creates a new buffer anyway.
-            prefs.replaySeconds = replay
-            prefs.delaySeconds = delay
-            if (inReplay) exitReplay()
-            messageText.visibility = View.GONE
+            if (single) prefs.loopback = d.loopback
+        }
+        // Restarting creates a new buffer anyway.
+        prefs.replaySeconds = replay
+        prefs.delaySeconds = delay
+        if (inReplay) exitReplay()
+        messageText.visibility = View.GONE
+        if (modeChanged) {
+            prefs.mode = d.mode
+            stopPipeline()
+            startForMode()
+        } else {
             applyLiveUi()
             restartPipeline()
-        } else {
-            applyDurations(replay, delay)
         }
     }
 

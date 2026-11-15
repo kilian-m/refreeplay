@@ -15,6 +15,25 @@
             style="@style/TextAppearance.Material3.LabelLarge"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
+            android:text="This phone is" />
+
+        <Spinner
+            android:id="@+id/spMode"
+            android:layout_width="match_parent"
+            android:layout_height="48dp" />
+
+        <!-- Not shown on a referee phone, which has no camera of its own running. -->
+        <LinearLayout
+            android:id="@+id/groupCamera"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+        <TextView
+            style="@style/TextAppearance.Material3.LabelLarge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
             android:text="Camera" />
 
         <Spinner
@@ -57,8 +76,11 @@
             android:id="@+id/spQuality"
             android:layout_width="match_parent"
             android:layout_height="48dp" />
+        </LinearLayout>
 
+        <!-- Not shown on a camera phone: the referee phone keeps the video. -->
         <LinearLayout
+            android:id="@+id/groupDurations"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="12dp"

@@ -51,6 +51,22 @@ class Prefs(context: Context) {
     var loopback: Boolean
         get() = sp.getBoolean("loopback", false)
         set(v) = sp.edit().putBoolean("loopback", v).apply()
+
+    /** What this phone does: [MODE_SINGLE], [MODE_CAMERA] or [MODE_REFEREE]. */
+    var mode: Int
+        get() = sp.getInt("mode", MODE_SINGLE).coerceIn(MODE_SINGLE, MODE_REFEREE)
+        set(v) = sp.edit().putInt("mode", v).apply()
+
+    companion object {
+        /** Camera and replay on this phone. */
+        const val MODE_SINGLE = 0
+
+        /** Camera only: the video is sent to a referee phone. */
+        const val MODE_CAMERA = 1
+
+        /** Replay only: the video comes from a camera phone. */
+        const val MODE_REFEREE = 2
+    }
 }
 
 /** How much memory a buffer of a given length needs, and how much this phone can give. */
