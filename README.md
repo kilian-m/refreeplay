@@ -38,6 +38,7 @@ Or with USB debugging: `adb install -r ReFreePlay.apk`
 ### Live screen
 - **REPLAY** (it shows the replay length) opens the replay screen.
 - **Quick save** stores the whole buffer (the last *N* seconds) in `Movies/ReFreePlay`, without asking.
+  With camera phones, every camera gets its own video, named after it.
 - **Volume keys** or a **Bluetooth selfie remote** (it sends Volume Up) also start a replay.
 - Pinch to zoom; double-tap resets the zoom.
 - With a display delay, the blue **⏱ DELAY** badge shows it (tap it to open the settings).
@@ -53,10 +54,10 @@ Or with USB debugging: `adb install -r ReFreePlay.apk`
 - **Tap the video** to hide the controls and see the whole picture; a thin progress line and the
   time stay at the bottom, and swiping still scrubs. Tap again to show the controls.
   **Double-tap** plays or pauses.
-- **◀| / |▶** step exactly one frame. **−1 s / +1 s** jump.
+- **◀| / |▶** step exactly one frame.
 - The **speed button** cycles 1× → ½× → ¼× → ⅛×.
 - The time display counts toward the moment the button was pressed (`0.00 s`).
-- **✂ (cut)** opens a two-handle slider to choose the part to keep. The video shows the frame
+- **⤓ (save)** opens a two-handle slider to choose the part to keep. The video shows the frame
   under the handle you drag; a white line marks the current position. **▶ Play** plays exactly
   the part that will be saved. Here too, tapping the video hides the cut panel; the thin line at the
   bottom then shows the selected part in red with a white marker at the current position, and the
@@ -66,7 +67,6 @@ Or with USB debugging: `adb install -r ReFreePlay.apk`
 
   The start of a cut snaps to the nearest earlier key frame, at most 0.5 s earlier, because clips
   are cut without re-encoding.
-- **⤓ (quick save)** stores the full clip in `Movies/ReFreePlay`.
 - **LIVE**, Back or Volume Down returns. Volume Up / remote plays or pauses.
 
 ### Portrait and landscape
@@ -92,7 +92,8 @@ as usual. No router or internet is needed: the main phone opens its own hotspot.
 
 - **REPLAY** takes a clip of every camera. The same button on the replay screen switches to the
   next camera at the same moment, playing or paused. Cutting and saving apply to the camera on
-  screen. The phones compare their clocks once a second, so the cameras line up to about a frame.
+  screen; **Quick save** on the live screen saves all cameras. The phones compare their clocks
+  once a second, so the cameras line up to about a frame.
 - **Everything is set on the main phone.** Replay length and display delay apply to all cameras.
   ⚙ lists the camera phones; **Camera settings** next to one chooses its camera, resolution,
   frame rate and quality. A camera phone's own ⚙ only lets it become a main phone again.

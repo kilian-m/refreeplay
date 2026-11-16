@@ -236,13 +236,8 @@
                 android:id="@+id/groupTransport"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_weight="5"
+                android:layout_weight="1"
                 android:orientation="horizontal">
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnBack1"
-                    style="@style/ReplayButton"
-                    android:text="−1 s" />
 
                 <com.google.android.material.button.MaterialButton
                     android:id="@+id/btnPrevFrame"
@@ -258,18 +253,13 @@
                     android:id="@+id/btnNextFrame"
                     style="@style/ReplayButton"
                     android:text="|▶︎" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnFwd1"
-                    style="@style/ReplayButton"
-                    android:text="+1 s" />
             </LinearLayout>
 
             <LinearLayout
                 android:id="@+id/groupExtras"
                 android:layout_width="0dp"
                 android:layout_height="wrap_content"
-                android:layout_weight="4"
+                android:layout_weight="1"
                 android:orientation="horizontal">
 
                 <com.google.android.material.button.MaterialButton
@@ -277,19 +267,11 @@
                     style="@style/ReplayButton"
                     android:text="1×" />
 
+                <!-- Opens the cut panel, which saves the chosen part (or all of it). -->
                 <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnCut"
+                    android:id="@+id/btnSaveClip"
                     style="@style/ReplayButton"
                     android:contentDescription="Cut and save"
-                    android:text=""
-                    app:icon="@drawable/ic_cut"
-                    app:iconGravity="textStart"
-                    app:iconPadding="0dp" />
-
-                <com.google.android.material.button.MaterialButton
-                    android:id="@+id/btnQuickSaveClip"
-                    style="@style/ReplayButton"
-                    android:contentDescription="Quick save"
                     android:text=""
                     app:icon="@drawable/ic_download"
                     app:iconGravity="textStart"
@@ -378,10 +360,14 @@
                 android:clickable="false"
                 android:focusable="false" />
         </FrameLayout>
+
+        <!-- Not aligned by text baseline: a label that wraps would push its button down. -->
         <LinearLayout
+            android:id="@+id/trimButtons"
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:layout_marginTop="6dp"
+            android:baselineAligned="false"
             android:orientation="horizontal">
 
             <com.google.android.material.button.MaterialButton

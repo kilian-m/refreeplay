@@ -142,11 +142,6 @@ class ReplayController(context: Context, playerView: PlayerView, private val lis
         requestSeek(t)
     }
 
-    fun jumpBy(deltaMs: Long) {
-        player.pause()
-        scrubTo(positionMs() + deltaMs)
-    }
-
     /** Shows exactly the previous (dir = -1) or next (dir = +1) frame. */
     fun stepFrame(dir: Int) {
         player.pause()

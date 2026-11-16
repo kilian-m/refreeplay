@@ -1220,9 +1220,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         for (group in listOf(groupTransport, groupExtras)) {
             (group.layoutParams as LinearLayout.LayoutParams).apply {
                 width = if (portrait) LinearLayout.LayoutParams.MATCH_PARENT else 0
-                weight = if (portrait) 0f else if (group === groupTransport) 5f else 4f
+                weight = if (portrait) 0f else 1f
                 group.layoutParams = this
             }
+        }
+        // The buttons of the cut panel too: with the style's wide padding, "Save as…" doesn't fit
+        // in a third of a narrow screen.
+        for (group in listOf(groupTransport, groupExtras, findViewById<LinearLayout>(R.id.trimButtons))) {
             for (i in 0 until group.childCount) {
                 (group.getChildAt(i) as? MaterialButton)?.apply {
                     isSingleLine = true
@@ -1657,12 +1661,9 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     private fun setupReplayControls() {
         findViewById<View>(R.id.btnLive).setOnClickListener { exitReplay() }
-        findViewById<View>(R.id.btnBack1).setOnClickListener { replay.jumpBy(-1000) }
-        findViewById<View>(R.id.btnFwd1).setOnClickListener { replay.jumpBy(1000) }
         findViewById<View>(R.id.btnPrevFrame).setOnClickListener { replay.stepFrame(-1) }
         findViewById<View>(R.id.btnNextFrame).setOnClickListener { replay.stepFrame(1) }
-        findViewById<View>(R.id.btnCut).setOnClickListener { openTrim() }
-        findViewById<View>(R.id.btnQuickSaveClip).setOnClickListener { quickSaveClip() }
+        findViewById<View>(R.id.btnSaveClip).setOnClickListener { openTrim() }
         btnPlay.setOnClickListener { replay.togglePlay() }
         btnSpeed.setOnClickListener {
             val i = SPEEDS.indexOfFirst { abs(it - prefs.playbackSpeed) < 0.001f }
@@ -1873,12 +1874,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         return if (whole) snap else snap.slice((v[0] * 1_000_000).toLong(), (v[1] * 1_000_000).toLong())
     }
 
-    /** Quick save of the replay (or the cut part) into Movies/ReFreePlay. */
-    private fun quickSaveClip() {
-        val clip = selectedClip() ?: return
-        saveSnapshotToGallery(clip, replayRotation) { ok -> if (ok && trimming) closeTrim() }
-    }
-
     /** Writes the replay (or the cut part) to a temporary file, then lets the user choose where to save it. */
     private fun saveClipAs() {
         val clip = selectedClip() ?: return
@@ -1905,13 +1900,15 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
 
     // ---------------------------------------------------------------- saving
 
-    private fun defaultFileName(): String =
-        "ReFreePlay_" + SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(Date()) + ".mp4"
+    /** "ReFreePlay_2026-01-31_18-05-09.mp4", with [suffix] (e.g. a camera's name) before the ending. */
+    private fun defaultFileName(time: Date = Date(), suffix: String = ""): String =
+        "ReFreePlay_" + SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.US).format(time) +
+            (if (suffix.isEmpty()) "" else "_" + suffix.lowercase(Locale.US).replace(' ', '-')) + ".mp4"
 
     /** Creates a pending video entry in Movies/ReFreePlay. */
-    private fun newGalleryEntry(): Uri {
+    private fun newGalleryEntry(name: String): Uri {
         val values = ContentValues().apply {
-            put(MediaStore.Video.Media.DISPLAY_NAME, defaultFileName())
+            put(MediaStore.Video.Media.DISPLAY_NAME, name)
             put(MediaStore.Video.Media.MIME_TYPE, "video/mp4")
             put(MediaStore.Video.Media.RELATIVE_PATH, Environment.DIRECTORY_MOVIES + "/" + SAVE_FOLDER)
             put(MediaStore.Video.Media.IS_PENDING, 1)
@@ -1924,53 +1921,69 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         contentResolver.update(uri, ContentValues().apply { put(MediaStore.Video.Media.IS_PENDING, 0) }, null, null)
     }
 
-    /** Quick save of the whole buffer (live / delay screen): straight into Movies/ReFreePlay. */
+    /** A pinned clip on its way into a file called [name]. */
+    private class GalleryClip(val snap: ReplaySnapshot, val rotation: Int, val name: String)
+
+    /**
+     * Quick save of the whole buffer (live / delay screen): straight into Movies/ReFreePlay.
+     * With camera phones, every camera gets its own video, named after it.
+     */
     private fun quickSaveBuffer() {
         if (quickSaving) return
-        // With two cameras: the one on screen.
-        val info = videoInfo() ?: return
-        val shown = shownFeed.buffer
-        val snap = shown.snapshot(shown.durationUs)
-        if (snap == null || snap.frames.size < 2) {
+        val now = Date()
+        val clips = feeds.mapNotNull { feed ->
+            val info = feedInfo(feed) ?: return@mapNotNull null
+            val snap = feed.buffer.snapshot(feed.buffer.durationUs) ?: return@mapNotNull null
+            if (snap.frames.size < 2) {
+                snap.release()
+                return@mapNotNull null
+            }
+            GalleryClip(snap, info.rotation, defaultFileName(now, if (feeds.size > 1) feedName(feed) else ""))
+        }
+        if (clips.isEmpty()) {
             toast("Nothing recorded yet")
             return
         }
         quickSaving = true
-        saveSnapshotToGallery(snap, info.rotation) { quickSaving = false }
-        snap.release() // the save holds its own pin
+        saveToGallery(clips) { quickSaving = false }
     }
 
     /**
-     * Writes [snap] (copying the compressed frames, no re-encoding) into a new video in
-     * Movies/ReFreePlay, then calls [onDone] on the UI thread.
+     * Writes each of [clips] (copying the compressed frames, no re-encoding) into a new video in
+     * Movies/ReFreePlay and releases it, then calls [onDone] on the UI thread.
      */
-    private fun saveSnapshotToGallery(snap: ReplaySnapshot, rotation: Int, onDone: (Boolean) -> Unit) {
-        if (!snap.retain()) {
-            toast("Saving failed: the buffer was cleared")
-            onDone(false)
-            return
-        }
-        val seconds = (snap.endPtsUs - snap.startPtsUs) / 1e6
-        toast("Saving %.1f s…".format(seconds))
+    private fun saveToGallery(clips: List<GalleryClip>, onDone: () -> Unit) {
+        val seconds = clips.maxOf { (it.snap.endPtsUs - it.snap.startPtsUs) / 1e6 }
+        toast(if (clips.size == 1) "Saving %.1f s…".format(seconds) else "Saving %.1f s of %d cameras…".format(seconds, clips.size))
         io.execute {
-            val result = runCatching {
-                val uri = newGalleryEntry()
-                try {
-                    contentResolver.openFileDescriptor(uri, "rw")!!.use { pfd ->
-                        val muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-                        Mp4Writer.write(snap, muxer, rotation)
+            var saved = 0
+            var problem: String? = null
+            for (clip in clips) {
+                runCatching {
+                    val uri = newGalleryEntry(clip.name)
+                    try {
+                        contentResolver.openFileDescriptor(uri, "rw")!!.use { pfd ->
+                            val muxer = MediaMuxer(pfd.fileDescriptor, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+                            Mp4Writer.write(clip.snap, muxer, clip.rotation)
+                        }
+                        publishGalleryEntry(uri)
+                    } catch (e: Exception) {
+                        contentResolver.delete(uri, null, null)
+                        throw e
                     }
-                    publishGalleryEntry(uri)
-                } catch (e: Exception) {
-                    contentResolver.delete(uri, null, null)
-                    throw e
-                }
+                }.onSuccess { saved++ }.onFailure { problem = it.message }
+                clip.snap.release()
             }
-            snap.release()
             ui.post {
-                result.onSuccess { toast("Saved %.1f s to Movies/%s".format(seconds, SAVE_FOLDER)) }
-                    .onFailure { toast("Saving failed: ${it.message}") }
-                onDone(result.isSuccess)
+                toast(
+                    when {
+                        saved == 0 -> "Saving failed: $problem"
+                        saved < clips.size -> "Saved only %d of %d videos: %s".format(saved, clips.size, problem)
+                        saved == 1 -> "Saved %.1f s to Movies/%s".format(seconds, SAVE_FOLDER)
+                        else -> "Saved %d videos (%.1f s) to Movies/%s".format(saved, seconds, SAVE_FOLDER)
+                    }
+                )
+                onDone()
             }
         }
     }
