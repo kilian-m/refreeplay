@@ -1266,8 +1266,11 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback, CameraControll
         liveActions.visibility = if (isCameraOnly) View.GONE else View.VISIBLE
         updatePairPanel()
         val decoded = liveFromBuffer()
-        // No picture of the camera phone before it connects (the view would show an old one).
-        delayView.visibility = if (decoded && videoInfo() != null) View.VISIBLE else View.GONE
+        // No picture of a camera phone before it connects (the view would show an old one). This
+        // phone's own delayed picture must not wait for the camera: right after the app starts
+        // the camera isn't set up yet, and a view that is gone never gets the surface to draw on.
+        delayView.visibility =
+            if (decoded && (shownFeed === ownFeed || videoInfo() != null)) View.VISIBLE else View.GONE
         delayBadge.visibility = if (delayed) View.VISIBLE else View.GONE
         setPreviewHidden(decoded)
         if (!delayed && showingDelayWait) {
